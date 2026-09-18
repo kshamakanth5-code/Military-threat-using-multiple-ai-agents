@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+pillow
+torch
+torchvision
+python-dotenv
+ultralytics
+openai-clip
+opencv-python>=4.8,<5
+transformers>=4.45,<6
+setuptools<81

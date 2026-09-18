@@ -1,0 +1,25 @@
+# Local secrets and environment files
+.env
+*.db
+
+# Python environments and caches
+.venv/
+.venv-1/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# JavaScript dependencies and build output
+node_modules/
+dist/
+build/
+
+# Generated data, logs, and training output
+dataset_frames/
+runs/
+*.log
+
+# Large model/checkpoint artifacts
+*.pt
+*.pth
+*.onnx

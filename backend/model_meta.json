@@ -1,0 +1,9 @@
+{
+  "classes": [
+    "Normal Class",
+    "Wall crossing"
+  ],
+  "trained_samples": 120,
+  "device": "cpu",
+  "threshold": 0.7
+}

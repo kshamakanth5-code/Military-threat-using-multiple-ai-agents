@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^npm --prefix \\.\\\\frontend run build$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
