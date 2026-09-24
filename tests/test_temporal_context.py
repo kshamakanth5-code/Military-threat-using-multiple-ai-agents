@@ -4,6 +4,18 @@ from backend.temporal_context import build_temporal_context
 
 
 class TemporalContextTests(unittest.TestCase):
+    def test_multiple_people_with_rapid_motion_flag_possible_altercation(self):
+        report = build_temporal_context({
+            'motionScore': 0.58,
+            'movingPersons': 2,
+            'personCount': 2,
+            'threatLevel': 'HIGH',
+            'detections': [],
+        })
+        self.assertTrue(report['interpersonalAggression'])
+        self.assertEqual(report['movementPattern'], 'possible physical altercation')
+        self.assertEqual(report['temporalAnomaly'], 'elevated')
+
     def test_high_motion_is_flagged_as_sudden_movement(self):
         report = build_temporal_context({
             'motionScore': 0.82,

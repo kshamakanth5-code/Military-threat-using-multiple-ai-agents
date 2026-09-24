@@ -95,6 +95,15 @@ const historicalAlerts = [
   { id: 'INC-2385', time: '23:16 PM', zone: 'Service Road', intent: 'Patrol validation', level: 'LOW' },
 ]
 
+const riskHeatColor = (risk, alpha) => {
+  if (risk >= 95) return `rgba(106, 0, 180, ${alpha})`
+  if (risk >= 90) return `rgba(235, 30, 35, ${alpha})`
+  if (risk >= 75) return `rgba(245, 125, 20, ${alpha})`
+  if (risk >= 60) return `rgba(250, 205, 35, ${alpha})`
+  if (risk >= 30) return `rgba(35, 190, 90, ${alpha})`
+  return `rgba(35, 100, 235, ${alpha})`
+}
+
 const poseConnections = [
   [0, 1], [0, 2], [1, 3], [2, 4], [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
   [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
@@ -195,7 +204,7 @@ const evaluateLiveFrame = (video) => {
   }
 }
 
-const analyzeLiveFrame = async (video) => {
+const analyzeLiveFrame = async (video, sessionToken) => {
   if (!video || video.readyState < 2) {
     return { status: 'Waiting for camera', action: 'No valid frame', confidence: 0, crimeDetected: false }
   }
@@ -235,7 +244,7 @@ const analyzeLiveFrame = async (video) => {
     const motionForRequest = video._motionMetrics || { score: 0, movingPersons: 0, movingObjects: 0 }
     const response = await fetch('http://localhost:8000/api/analyze-frame', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
       body: JSON.stringify({
         image: canvas.toDataURL('image/jpeg', 0.7),
         motionScore: motionForRequest.score,
@@ -255,9 +264,11 @@ const analyzeLiveFrame = async (video) => {
     const candidateActivity = Object.entries(activityCounts).sort((first, second) => second[1] - first[1])[0]?.[0] || 'unknown'
     const previousActivity = video._stableActivity || 'unknown'
     const candidateFrames = activityHistory.filter((label) => label === candidateActivity).length
-    const stableActivity = previousActivity === 'unknown' || candidateActivity === previousActivity || candidateFrames >= 3
-      ? candidateActivity
-      : previousActivity
+    const stableActivity = previousActivity === 'unknown'
+      ? candidateFrames >= 3 ? candidateActivity : 'unknown'
+      : candidateActivity === previousActivity || candidateFrames >= 3
+        ? candidateActivity
+        : previousActivity
     video._stableActivity = stableActivity
     const threatHistory = [...(video._threatHistory || []), payload.threatLevel || 'LOW'].slice(-5)
     video._threatHistory = threatHistory
@@ -285,16 +296,25 @@ const analyzeLiveFrame = async (video) => {
     const strongest = payload.confidence || payload.detections?.reduce((best, detection) => Math.max(best, detection.confidence), 0) || 0
     return {
       status,
-      action: payload.detected ? payload.message : stableActivity !== 'unknown' ? `Human activity: ${stableActivity}` : motion.movingPersons ? 'Person movement tracked' : motion.movingObjects ? 'Object movement tracked' : personPresent ? 'Monitoring person movement' : 'No person detected in current frame',
+      action: payload.detected || payload.aggressionDetected ? payload.message : stableActivity !== 'unknown' ? `Human activity: ${stableActivity}` : motion.movingPersons ? 'Person movement tracked' : motion.movingObjects ? 'Object movement tracked' : personPresent ? 'Monitoring person movement' : 'No person detected in current frame',
       confidence: payload.detected ? strongest : activity.confidence,
       threatLevel: isAssessing ? 'LOW' : stableThreatLevel,
+      riskScore: payload.riskScore || payload.confidence || 0,
+      riskRegions: payload.riskRegions || [],
+      riskThresholdHeatmap: payload.riskThresholdHeatmap ?? 60,
+      riskThresholdEmail: payload.riskThresholdEmail ?? 95,
+      timestamp: payload.timestamp,
+      alert: payload.alert || null,
+      threatEvent: payload.threatEvent || null,
       crimeDetected: !isAssessing && stableThreatLevel === 'HIGH',
       riskConfirmed: !isAssessing,
       assessmentFrames: threatHistory.length,
       motion,
       activity: stableActivity,
       rawActivity: payload.rawActivity || stableActivity,
-      activityClasses: payload.activityClasses || ['standing', 'sitting', 'walking', 'running', 'crawling', 'sleeping'],
+      activitySource: payload.activitySource || 'unknown',
+      activityQuality: payload.activityQuality || 'LOW',
+      activityClasses: payload.activityClasses || ['standing', 'sitting', 'squatting', 'walking', 'running', 'jumping', 'dancing', 'waving', 'hands_up', 'clapping', 'kicking', 'bending', 'falling', 'lying', 'crawling', 'sleeping', 'fighting'],
       pose: payload.pose || [],
       detections: payload.detections || [],
       personCount: payload.personCount || 0,
@@ -306,6 +326,7 @@ const analyzeLiveFrame = async (video) => {
       anomalyRisk: payload.anomalyRisk || null,
       facialExpression: payload.facialExpression || null,
       nextActionPrediction: payload.nextActionPrediction || null,
+      aggressionDetected: Boolean(payload.aggressionDetected),
       researchSummary: payload.researchSummary || null,
     }
   } catch {
@@ -323,12 +344,14 @@ function App() {
   const [showPassword, setShowPassword] = useState(false)
   const [email, setEmail] = useState('')
   const [accountEmail, setAccountEmail] = useState('')
+  const [sessionToken, setSessionToken] = useState('')
   const [authMode, setAuthMode] = useState('login')
   const [loginError, setLoginError] = useState('')
   const [accountMessage, setAccountMessage] = useState('')
   const [scenario, setScenario] = useState('critical')
   const [selectedAgent, setSelectedAgent] = useState(4)
   const [cameraEnabled, setCameraEnabled] = useState(true)
+  const [cameraViewMode, setCameraViewMode] = useState('normal')
   const [cameraError, setCameraError] = useState('')
   const [alarmEnabled, setAlarmEnabled] = useState(true)
   const [uploadedFile, setUploadedFile] = useState(null)
@@ -337,18 +360,26 @@ function App() {
   const [logs, setLogs] = useState(initialLogs)
   const [agentMesh, setAgentMesh] = useState(defaultAgents)
   const [notificationStatus, setNotificationStatus] = useState('')
+  const [confirmationStatus, setConfirmationStatus] = useState('')
   const [liveThreatState, setLiveThreatState] = useState({
     status: 'Waiting for camera',
     action: 'No live action detected yet',
     confidence: 0,
     crimeDetected: false,
     threatLevel: 'LOW',
+    riskScore: 0,
+    riskRegions: [],
+    riskThresholdHeatmap: 60,
+    riskThresholdEmail: 95,
+    activity: 'unknown',
+    activityConfidence: 0,
     multimodalRisk: null,
     temporalContext: null,
     anomalyRisk: null,
     facialExpression: null,
     nextActionPrediction: null,
     researchSummary: null,
+    alert: null,
   })
   const [liveDetections, setLiveDetections] = useState([])
   const [agentMode, setAgentMode] = useState('MEDIUM')
@@ -357,6 +388,11 @@ function App() {
   const currentScenario = scenarioConfig[scenario]
   const activeAgent = agentMesh[selectedAgent] || defaultAgents[selectedAgent]
   const hasLiveAnalysis = liveThreatState.pose?.length > 0 || liveDetections.length > 0
+  const maximumRisk = Math.max(
+    Number(liveThreatState.riskScore || 0),
+    ...(liveThreatState.riskRegions || []).map((region) => Number(region.riskScore || 0)),
+  )
+  const heatmapScreenColor = riskHeatColor(maximumRisk, maximumRisk >= 95 ? 0.42 : maximumRisk >= 60 ? 0.24 : 0.12)
 
   const detectedObjects = useMemo(() => {
     const objects = ['Person', 'Pen', 'Package', 'Vehicle']
@@ -462,7 +498,7 @@ function App() {
 
     let active = true
     const analyze = async () => {
-      const result = await analyzeLiveFrame(videoRef.current)
+      const result = await analyzeLiveFrame(videoRef.current, sessionToken)
       if (!active) return
       setLiveThreatState(result)
       setLiveDetections(result.detections || [])
@@ -473,55 +509,28 @@ function App() {
     const interval = setInterval(analyze, 2000)
 
     return () => { active = false; clearInterval(interval) }
-  }, [cameraEnabled, isLoggedIn, uploadedFile])
+  }, [cameraEnabled, isLoggedIn, uploadedFile, sessionToken])
 
   useEffect(() => {
-    if (!isLoggedIn || !accountEmail) return
+    const alert = liveThreatState.alert
+    if (!alert || alert.emailStatus === 'NOT_ELIGIBLE' || alert.emailStatus === 'AWAITING_CONFIRMATION') return
+    setNotificationStatus(`Alert ${alert.alertId || 'pending'}: ${alert.emailStatus.toLowerCase().replaceAll('_', ' ')}`)
+    if (['SENT', 'FAILED'].includes(alert.emailStatus) && 'Notification' in window && Notification.permission === 'granted') {
+      const notificationKey = alert.alertId || `${liveThreatState.timestamp}:${liveThreatState.riskScore}`
+      if (window._lastThreatNotification !== notificationKey) {
+        window._lastThreatNotification = notificationKey
+        new Notification('ATAS critical threat alert', {
+          body: `Risk ${liveThreatState.riskScore}% - ${liveThreatState.action}`,
+          tag: notificationKey,
+        })
+      }
+    }
+  }, [liveThreatState.alert])
 
-    const level = String(liveThreatState.threatLevel || (liveThreatState.crimeDetected ? 'HIGH' : 'LOW')).toUpperCase()
-    const isHighRisk = level === 'HIGH' || level === 'CRITICAL'
-    const confidence = Number(liveThreatState.confidence || 0)
-    const exceedsEmailThreshold = confidence > 90
-    const hasLiveThreat = liveThreatState.status && liveThreatState.status !== 'Waiting for camera' && liveThreatState.status !== 'Live camera active'
-
-    if (!isHighRisk || !exceedsEmailThreshold || !hasLiveThreat) return
-
-    const signature = `${level}:${liveThreatState.status}:${liveThreatState.action}`
-    if (lastAlertRef.current === signature || alertCooldownRef.current === signature) return
-
-    lastAlertRef.current = signature
-    alertCooldownRef.current = signature
-
-    fetch('http://localhost:8000/api/threat-alert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: accountEmail,
-        level,
-        confidence,
-        summary: liveThreatState.status,
-        action: liveThreatState.action,
-      }),
-    })
-      .then(async (response) => {
-        const payload = await response.json()
-        if (!response.ok || !payload.ok) {
-          throw new Error(payload.message || 'Threat notification failed.')
-        }
-        setNotificationStatus(payload.emailSent
-          ? `HIGH-RISK email queued for ${payload.recipientCount || 1} registered account(s).`
-          : 'HIGH-RISK detected. Email is not configured on the server.')
-      })
-      .catch((error) => {
-        setNotificationStatus(error.message)
-      })
-
-    const resetTimer = setTimeout(() => {
-      alertCooldownRef.current = ''
-    }, 30000)
-
-    return () => clearTimeout(resetTimer)
-  }, [accountEmail, isLoggedIn, liveThreatState])
+  useEffect(() => {
+    if (!isLoggedIn || !('Notification' in window) || Notification.permission !== 'default') return
+    Notification.requestPermission().catch(() => {})
+  }, [isLoggedIn])
 
   useEffect(() => {
     if (!videoRef.current) return
@@ -606,6 +615,7 @@ function App() {
       }
       setLoginError('')
       setAccountEmail(payload.email)
+      setSessionToken(payload.sessionToken)
       setIsLoggedIn(true)
     } catch {
       setLoginError('Backend unavailable. Start the API on port 8000 and try again.')
@@ -632,6 +642,21 @@ function App() {
       setPassword('')
     } catch {
       setLoginError('Backend unavailable. Start the API on port 8000 and try again.')
+    }
+  }
+
+  const resendConfirmation = async () => {
+    setConfirmationStatus('Sending confirmation message...')
+    try {
+      const response = await fetch('http://localhost:8000/api/resend-confirmation', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      })
+      const payload = await response.json()
+      if (!response.ok || !payload.ok) throw new Error(payload.message || 'Confirmation resend failed.')
+      setConfirmationStatus(payload.message)
+    } catch (error) {
+      setConfirmationStatus(error.message || 'Confirmation email delivery failed.')
     }
   }
 
@@ -789,15 +814,44 @@ function App() {
               <p className="text-[10px] uppercase tracking-[0.28em] text-white/45">Private camera session</p>
               <h1 className="mt-1 text-xl font-medium">Threat monitor</h1>
             </div>
-            <button type="button" onClick={() => setIsLoggedIn(false)} className="border border-white/20 px-3 py-2 text-xs text-white/70 hover:bg-white hover:text-black">
-              Sign out
-            </button>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={resendConfirmation} className="border border-white/20 px-3 py-2 text-xs text-white/70 hover:bg-white hover:text-black">
+                Resend confirmation
+              </button>
+              <button type="button" onClick={() => { setIsLoggedIn(false); setSessionToken(''); setAccountEmail('') }} className="border border-white/20 px-3 py-2 text-xs text-white/70 hover:bg-white hover:text-black">
+                Sign out
+              </button>
+            </div>
           </header>
+
+          {confirmationStatus && (
+            <p className="mb-4 border border-cyan-400/30 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100">
+              {confirmationStatus}
+            </p>
+          )}
 
           <section className="border border-white/15 bg-black">
             <div className="flex items-center justify-between border-b border-white/15 px-4 py-3 text-xs text-white/55">
               <span>{accountEmail}</span>
-              <span className="flex items-center gap-2 text-white/75"><span className="status-dot bg-white" /> Webcam · scanning</span>
+              <div className="flex items-center gap-3">
+                <div className="flex border border-white/20 text-[10px] uppercase tracking-[0.14em]">
+                  <button
+                    type="button"
+                    onClick={() => setCameraViewMode('normal')}
+                    className={`px-2 py-1 ${cameraViewMode === 'normal' ? 'bg-white text-black' : 'text-white/60 hover:text-white'}`}
+                  >
+                    Normal camera
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCameraViewMode('heatmap')}
+                    className={`border-l border-white/20 px-2 py-1 ${cameraViewMode === 'heatmap' ? 'bg-red-500 text-white' : 'text-white/60 hover:text-white'}`}
+                  >
+                    Heatmap camera
+                  </button>
+                </div>
+                <span className="flex items-center gap-2 text-white/75"><span className="status-dot bg-white" /> Webcam · scanning</span>
+              </div>
             </div>
             <div className="relative aspect-video bg-black">
               {cameraEnabled && !uploadedFile && !cameraError ? (
@@ -813,6 +867,35 @@ function App() {
                 </div>
               )}
               <div className="pointer-events-none absolute inset-0">
+                {cameraViewMode === 'heatmap' && (
+                  <div
+                    className="absolute inset-0"
+                    style={{
+                      background: `radial-gradient(circle at 50% 45%, ${heatmapScreenColor}, transparent 78%), ${heatmapScreenColor}`,
+                      mixBlendMode: 'screen',
+                    }}
+                  />
+                )}
+                {cameraViewMode === 'heatmap' && liveThreatState.riskRegions?.filter((region) => region.heatmapActive).map((region) => {
+                  const intensity = Math.max(0.18, Math.min(0.9, (region.riskScore - liveThreatState.riskThresholdHeatmap) / 40 + 0.18))
+                  const heatColor = riskHeatColor(region.riskScore, intensity)
+                  return (
+                    <div
+                      key={`heat-${region.personId}`}
+                      className="absolute rounded-full"
+                      style={{
+                        left: `${region.centerX}%`,
+                        top: `${region.centerY}%`,
+                        width: `${Math.max(region.width * 1.8, 18)}%`,
+                        height: `${Math.max(region.height * 1.2, 18)}%`,
+                        transform: 'translate(-50%, -50%)',
+                        opacity: intensity,
+                        background: `radial-gradient(circle, ${heatColor} 0%, ${riskHeatColor(region.riskScore, intensity * 0.65)} 34%, transparent 78%)`,
+                        filter: 'blur(5px)',
+                      }}
+                    />
+                  )
+                })}
                 {liveThreatState.pose?.map((person, personIndex) => (
                   <svg key={`simple-pose-${personIndex}`} className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="Human pose skeleton">
                     {poseConnections.map(([start, end]) => {
@@ -857,8 +940,19 @@ function App() {
                    Humans: {liveThreatState.personCount || liveThreatState.pose?.length || 0} · Sharp objects: {liveThreatState.sharpObjectCount || 0}
                  </p>
                 <p className="mt-1 text-[10px] text-white/40">Raw model inference: {liveThreatState.rawActivity || 'unknown'}</p>
+                <p className="mt-1 text-[10px] text-amber-200/75">
+                  Heatmap regions: {liveThreatState.riskRegions?.filter((region) => region.heatmapActive).length || 0} active
+                </p>
             </div>
             <span className="text-sm text-white/70">{liveThreatState.confidence}%</span>
+          </div>
+          <div className="mt-3 border border-amber-400/25 bg-amber-500/5 px-4 py-3 text-xs text-amber-100">
+            {liveThreatState.riskRegions?.length ? liveThreatState.riskRegions.map((region) => (
+              <div key={region.personId} className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-200/10 py-1 last:border-0">
+                <span>{region.personId} · {region.label} · {String(region.activity).replaceAll('_', ' ')}</span>
+                <span>{region.riskScore}% · {String(region.riskBand).replaceAll('_', ' ')}</span>
+              </div>
+            )) : 'No person risk regions detected.'}
           </div>
             <div className="mt-3 flex flex-wrap items-center gap-2 border border-white/15 px-4 py-3">
               <span className="text-xs text-white/55">HAR result is model-detected, not user-selected</span>
@@ -929,12 +1023,30 @@ function App() {
               <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-cyan-200">
                 Confidence {liveThreatState.confidence}%
               </span>
+              <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-emerald-200">
+                Activity {String(liveThreatState.activity || 'unknown').replaceAll('_', ' ')}
+              </span>
             </div>
             <p className="text-base text-slate-100">{threatMessage}</p>
+            <div className="mt-3 border border-emerald-400/25 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-100">
+              <span className="uppercase tracking-[0.2em] text-emerald-300/70">Recognized activity</span>
+              <strong className="ml-3 text-sm uppercase">{liveThreatState.activity || 'unknown'}</strong>
+              <span className="ml-3 text-emerald-200/70">{liveThreatState.activityConfidence || 0}% confidence</span>
+              <span className="ml-3 text-emerald-200/70">{liveThreatState.activityQuality || 'LOW'} quality</span>
+            </div>
             {notificationStatus && (
               <p className="mt-3 border border-red-400/40 bg-red-500/10 px-3 py-2 text-xs text-red-200">
                 {notificationStatus}
               </p>
+            )}
+            {liveThreatState.alert && (
+              <div className="mt-3 grid gap-2 border border-white/15 bg-white/[0.03] p-3 text-xs text-white/70 sm:grid-cols-2">
+                <span>Threat status: {liveThreatState.threatLevel}</span>
+                <span>Risk score: {liveThreatState.riskScore ?? liveThreatState.confidence}%</span>
+                <span>Alert ID: {liveThreatState.alert.alertId || 'Pending confirmation'}</span>
+                <span>Email status: {liveThreatState.alert.emailStatus}</span>
+                <span className="sm:col-span-2">Timestamp: {liveThreatState.timestamp || 'Not available'}</span>
+              </div>
             )}
           </div>
 

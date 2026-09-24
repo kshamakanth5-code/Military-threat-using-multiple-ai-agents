@@ -1,5 +1,6 @@
 # Local secrets and environment files
 .env
+*.env.local
 *.db
 
 # Python environments and caches

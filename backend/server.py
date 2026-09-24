@@ -8,20 +8,23 @@ import smtplib
 import sqlite3
 import base64
 import io
+import uuid
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from dotenv import load_dotenv
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 
 from backend.agents import build_agent_mesh as build_agent_mesh_from_module
+from backend.agents import process_threat_event
 from backend.anomaly_risk import build_anomaly_risk_report
 from backend.facial_expression import analyze_facial_expression, predict_next_actions
 from backend.multimodal_risk import build_multimodal_risk_report, build_research_summary
-from backend.temporal_context import build_temporal_context
+from backend.temporal_context import build_temporal_context, detect_interpersonal_aggression
 from backend.train_pipeline import dataset_overview, predict_image, train_model
 
 app = FastAPI(title='Threat Detection API', version='1.0.0')
@@ -45,8 +48,14 @@ PERSON_MODEL_PATH = MODEL_ROOT / 'yolo11n.pt'
 POSE_MODEL_PATH = MODEL_ROOT / 'yolo11n-pose.pt'
 SHARP_MATERIAL_POLICY = 'Any detector-positive object is treated as a potential weapon.'
 SHARP_LABELS = {'scissors', 'knife', 'gun', 'sword'}
-HIGH_RISK_EMAIL_CONFIDENCE = 90.0
-ACTIVITY_CLASSES = ['standing', 'sitting', 'walking', 'running', 'crawling', 'sleeping']
+RISK_THRESHOLD = float(os.getenv('RISK_THRESHOLD', '95'))
+ACTIVITY_CLASSES = [
+    'standing', 'sitting', 'squatting', 'walking', 'running', 'jumping',
+    'dancing', 'waving', 'hands_up', 'clapping', 'kicking', 'bending',
+    'falling', 'lying', 'crawling', 'sleeping',
+]
+RISK_THRESHOLD_HEATMAP = float(os.getenv('RISK_THRESHOLD_HEATMAP', '60'))
+RISK_THRESHOLD_EMAIL = float(os.getenv('RISK_THRESHOLD_EMAIL', os.getenv('RISK_THRESHOLD', '95')))
 weapon_model = None
 person_model = None
 pose_model = None
@@ -67,7 +76,6 @@ class RegisterRequest(BaseModel):
 
 
 class ThreatAlertRequest(BaseModel):
-    email: str
     level: str
     summary: str
     action: str
@@ -90,6 +98,33 @@ class AgentFeedbackRequest(BaseModel):
     observedActivity: str
     correctedActivity: str
     threatLevel: str = 'LOW'
+
+
+def initialize_account_db():
+    with sqlite3.connect(ACCOUNT_DB) as connection:
+        connection.execute('CREATE TABLE IF NOT EXISTS accounts (user_id TEXT UNIQUE, email TEXT PRIMARY KEY, user_name TEXT NOT NULL, password_hash TEXT NOT NULL)')
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(accounts)').fetchall()}
+        if 'user_id' not in columns:
+            connection.execute('ALTER TABLE accounts ADD COLUMN user_id TEXT')
+            rows = connection.execute('SELECT email FROM accounts WHERE user_id IS NULL').fetchall()
+            for (email,) in rows:
+                connection.execute('UPDATE accounts SET user_id = ? WHERE email = ?', (str(uuid.uuid4()), email))
+        connection.execute('CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL)')
+
+
+def authenticated_user(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.lower().startswith('bearer '):
+        raise HTTPException(status_code=401, detail='Authentication required.')
+    token = authorization[7:].strip()
+    initialize_account_db()
+    with sqlite3.connect(ACCOUNT_DB) as connection:
+        account = connection.execute(
+            'SELECT a.user_id, a.email, a.user_name FROM sessions s JOIN accounts a ON a.user_id = s.user_id WHERE s.token = ?',
+            (token,),
+        ).fetchone()
+    if not account:
+        raise HTTPException(status_code=401, detail='Invalid or expired session.')
+    return {'userId': account[0], 'email': account[1], 'userName': account[2]}
 
 
 def build_agent_mesh(dataset_info: dict, threat_level: str = 'MEDIUM', action: str = 'perimeter scan'):
@@ -213,6 +248,8 @@ def classify_activity(person_box, keypoints, motion_score):
     hip_points = [points_by_index[index] for index in (11, 12) if index in points_by_index]
     knee_points = [points_by_index[index] for index in (13, 14) if index in points_by_index]
     ankle_points = [points_by_index[index] for index in (15, 16) if index in points_by_index]
+    elbow_points = [points_by_index[index] for index in (7, 8) if index in points_by_index]
+    wrist_points = [points_by_index[index] for index in (9, 10) if index in points_by_index]
     if shoulder_points and hip_points and knee_points and ankle_points:
         shoulder_y = sum(point['y'] for point in shoulder_points) / len(shoulder_points)
         hip_y = sum(point['y'] for point in hip_points) / len(hip_points)
@@ -221,6 +258,39 @@ def classify_activity(person_box, keypoints, motion_score):
         torso_length = max(hip_y - shoulder_y, 1)
         knee_leg_length = knee_y - hip_y
         ankle_leg_length = ankle_y - knee_y
+        ankle_spread = abs(ankle_points[0]['x'] - ankle_points[1]['x']) if len(ankle_points) == 2 else 0
+        wrist_spread = abs(wrist_points[0]['x'] - wrist_points[1]['x']) if len(wrist_points) == 2 else 0
+        arms_raised = len(wrist_points) == 2 and all(point['y'] < shoulder_y - torso_length * 0.1 for point in wrist_points)
+        asymmetric_pose = (
+            (len(wrist_points) == 2 and abs(wrist_points[0]['y'] - wrist_points[1]['y']) > torso_length * 0.35)
+            or (len(ankle_points) == 2 and ankle_spread > torso_length * 0.9)
+        )
+        compact_legs = knee_leg_length < torso_length * 0.75 and ankle_leg_length < torso_length * 0.9
+        knees_bent = knee_leg_length < torso_length * 0.85
+        wrists_together = len(wrist_points) == 2 and abs(wrist_points[0]['x'] - wrist_points[1]['x']) < torso_length * 0.35 and abs(wrist_points[0]['y'] - wrist_points[1]['y']) < torso_length * 0.35
+        hands_above_head = len(wrist_points) == 2 and all(point['y'] < min(shoulder_y, ankle_points[0]['y']) - torso_length * 0.25 for point in wrist_points)
+        leg_lifted = len(ankle_points) == 2 and abs(ankle_points[0]['y'] - ankle_points[1]['y']) > torso_length * 0.65
+        torso_horizontal = abs(hip_y - shoulder_y) < torso_length * 0.6
+        if motion_score >= 0.35 and arms_raised and compact_legs:
+            return {'label': 'jumping', 'confidence': round(min(97, 70 + motion_score * 25 + visible_joints))}
+        if motion_score >= 0.2 and arms_raised and asymmetric_pose:
+            return {'label': 'dancing', 'confidence': round(min(95, 65 + motion_score * 25 + visible_joints))}
+        if hands_above_head:
+            return {'label': 'hands_up', 'confidence': round(min(96, 72 + visible_joints))}
+        if motion_score >= 0.25 and wrists_together:
+            return {'label': 'clapping', 'confidence': round(min(92, 65 + motion_score * 25 + visible_joints))}
+        if motion_score >= 0.25 and leg_lifted:
+            return {'label': 'kicking', 'confidence': round(min(93, 65 + motion_score * 25 + visible_joints))}
+        if torso_horizontal and motion_score < 0.3:
+            return {'label': 'lying', 'confidence': round(min(91, 63 + visible_joints * 2))}
+        if knees_bent and motion_score < 0.25:
+            return {'label': 'squatting', 'confidence': round(min(90, 62 + visible_joints * 2))}
+        if abs(hip_y - shoulder_y) < torso_length * 0.8 and motion_score >= 0.15:
+            return {'label': 'bending', 'confidence': round(min(89, 60 + motion_score * 25 + visible_joints))}
+        if motion_score >= 0.18 and len(wrist_points) == 2 and wrist_spread > torso_length * 1.5 and not shoulder_points[0]['y'] > hip_y:
+            return {'label': 'waving', 'confidence': round(min(91, 62 + visible_joints * 2))}
+        if aspect_ratio >= 1.45 and hip_y > shoulder_y and knee_y < hip_y:
+            return {'label': 'falling', 'confidence': round(min(90, 60 + motion_score * 30 + visible_joints))}
         if knee_leg_length < torso_length * 0.65 and ankle_leg_length > torso_length * 0.45:
             return {'label': 'sitting', 'confidence': round(min(94, 65 + visible_joints * 2))}
     if aspect_ratio >= 1.7 and motion_score < 0.25:
@@ -232,6 +302,92 @@ def classify_activity(person_box, keypoints, motion_score):
     if motion_score >= 0.12:
         return {'label': 'walking', 'confidence': round(min(90, 55 + motion_score * 35))}
     return {'label': 'standing', 'confidence': round(min(88, 48 + visible_joints * 2))}
+
+
+def box_iou(first_box: list[float], second_box: list[float]) -> float:
+    first_x, first_y, first_width, first_height = first_box
+    second_x, second_y, second_width, second_height = second_box
+    left = max(first_x, second_x)
+    top = max(first_y, second_y)
+    right = min(first_x + first_width, second_x + second_width)
+    bottom = min(first_y + first_height, second_y + second_height)
+    intersection = max(0, right - left) * max(0, bottom - top)
+    first_area = first_width * first_height
+    second_area = second_width * second_height
+    union = first_area + second_area - intersection
+    return intersection / union if union else 0
+
+
+def deduplicate_person_detections(detections: list[dict], iou_threshold: float = 0.6) -> list[dict]:
+    unique: list[dict] = []
+    for detection in sorted(detections, key=lambda item: item['confidence'], reverse=True):
+        if not any(box_iou(detection['box'], existing['box']) >= iou_threshold for existing in unique):
+            unique.append(detection)
+    return unique
+
+
+def classify_risk_band(risk_score: float) -> str:
+    if risk_score >= RISK_THRESHOLD_EMAIL:
+        return 'CRITICAL'
+    if risk_score >= 90:
+        return 'VERY_HIGH_RISK'
+    if risk_score >= 75:
+        return 'SERIOUS_RISK'
+    if risk_score >= RISK_THRESHOLD_HEATMAP:
+        return 'HIGH_RISK'
+    if risk_score >= 30:
+        return 'LOW_RISK'
+    return 'NORMAL'
+
+
+def build_risk_regions(person_detections, pose_detections, motion_score: float, sharp_detections, object_detections=None) -> list[dict]:
+    regions = []
+    for index, person in enumerate(person_detections):
+        activity = pose_detections[index] if index < len(pose_detections) else {}
+        activity_label = str(activity.get('activity', 'standing')).lower()
+        activity_risk = {
+            'standing': 8, 'sitting': 5, 'squatting': 12, 'walking': 18,
+            'running': 62, 'jumping': 68, 'dancing': 35, 'waving': 22,
+            'hands_up': 42, 'clapping': 28, 'kicking': 72, 'bending': 20,
+            'falling': 78, 'lying': 8, 'crawling': 48, 'sleeping': 3,
+            'fighting': 96,
+        }.get(activity_label, 10)
+        risk_score = round(min(100, activity_risk + (motion_score * 30)), 1)
+        box = person['box']
+        regions.append({
+            'personId': f'person_{index + 1:02d}',
+            'entityType': 'person',
+            'label': 'Person',
+            'x': box[0],
+            'y': box[1],
+            'width': box[2],
+            'height': box[3],
+            'centerX': round(box[0] + box[2] / 2, 2),
+            'centerY': round(box[1] + box[3] / 2, 2),
+            'riskScore': risk_score,
+            'riskBand': classify_risk_band(risk_score),
+            'heatmapActive': risk_score >= RISK_THRESHOLD_HEATMAP,
+            'activity': activity.get('activity', 'unknown'),
+        })
+    for index, item in enumerate(object_detections or []):
+        box = item['box']
+        risk_score = round(min(100, float(item.get('confidence', 0)) * 0.8 + motion_score * 20), 1)
+        regions.append({
+            'personId': f'object_{index + 1:02d}',
+            'entityType': 'object',
+            'label': item.get('label', 'Object'),
+            'x': box[0],
+            'y': box[1],
+            'width': box[2],
+            'height': box[3],
+            'centerX': round(box[0] + box[2] / 2, 2),
+            'centerY': round(box[1] + box[3] / 2, 2),
+            'riskScore': risk_score,
+            'riskBand': classify_risk_band(risk_score),
+            'heatmapActive': risk_score >= RISK_THRESHOLD_HEATMAP,
+            'activity': 'detected object',
+        })
+    return regions
 
 
 def load_sharp_model():
@@ -251,7 +407,7 @@ def load_sharp_model():
 
 
 @app.post('/api/analyze-frame')
-def analyze_frame(payload: CameraFrameRequest):
+def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticated_user)):
     model = load_weapon_model()
     people_model = load_person_model()
 
@@ -270,6 +426,8 @@ def analyze_frame(payload: CameraFrameRequest):
             class_id = int(box.cls.item())
             coordinates = box.xyxy[0].tolist()
             label = model.names.get(class_id, f'class_{class_id}') if isinstance(model.names, dict) else str(class_id)
+            if label.lower() not in SHARP_LABELS:
+                continue
             detections.append({'classId': class_id, 'label': label, 'isPerson': False, 'isSharp': True, 'source': 'weapon_model', 'confidence': round(confidence * 100, 1), 'box': [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]})
 
     sharp_detector = load_sharp_model()
@@ -300,6 +458,8 @@ def analyze_frame(payload: CameraFrameRequest):
             else:
                 detections.append(detection)
 
+    person_detections = deduplicate_person_detections(person_detections)
+
     detected = bool(detections)
     all_detections = person_detections + detections
     sharp_detections = [item for item in detections if item.get('isSharp')]
@@ -325,13 +485,16 @@ def analyze_frame(payload: CameraFrameRequest):
                 'activity': activity_result['label'],
                 'rawActivity': activity_result['label'],
                 'confidence': activity_result['confidence'],
+                'source': 'pose_geometry_heuristic',
+                'keypointCount': len(points),
             })
 
     object_confidence = max((item['confidence'] for item in detections), default=0)
     person_motion = payload.movingPersons > 0
     object_motion = payload.movingObjects > 0
+    interpersonal_aggression = detect_interpersonal_aggression(len(person_detections), motion_score, payload.movingPersons)
     evidence_score = (object_confidence / 100 * 0.55) + (motion_score * 0.3) + (0.15 if person_detections else 0)
-    level = 'HIGH' if sharp_detections or (person_detections and ((detected and object_confidence >= 70) or motion_score >= 0.55)) else 'MEDIUM' if detected or person_motion or object_motion else 'LOW'
+    level = 'HIGH' if sharp_detections or interpersonal_aggression or (person_detections and ((detected and object_confidence >= 70) or motion_score >= 0.55)) else 'MEDIUM' if detected or person_motion or object_motion else 'LOW'
     confidence = round(min(99, evidence_score * 100)) if (detected or person_detections or person_motion) else 5
     if level == 'HIGH':
         confidence = max(confidence, 75)
@@ -346,10 +509,14 @@ def analyze_frame(payload: CameraFrameRequest):
             'moving_objects': payload.movingObjects,
             'person_count': len(person_detections),
             'sharp_object_count': len(sharp_detections),
+            'interpersonal_aggression': interpersonal_aggression,
         }
     agent_mesh[0]['payload']['detections'] = all_detections
-    activity = pose_detections[0]['activity'] if pose_detections else 'person and object moving' if person_motion and object_motion else 'person moving' if person_motion else 'object moving' if object_motion else 'object detected' if detected else 'scene clear'
-    activity_confidence = pose_detections[0]['confidence'] if pose_detections else 0
+    activity = 'fighting' if interpersonal_aggression else pose_detections[0]['activity'] if pose_detections else 'walking' if person_motion and motion_score >= 0.12 else 'standing' if person_detections else 'object moving' if object_motion else 'object detected' if detected else 'unknown'
+    activity_confidence = pose_detections[0]['confidence'] if pose_detections else 55 if person_detections else 0
+    activity_source = pose_detections[0]['source'] if pose_detections else 'person-motion-fallback' if person_detections else 'scene-fallback'
+    activity_quality = 'HIGH' if pose_detections and pose_detections[0]['keypointCount'] >= 10 else 'MEDIUM' if pose_detections else 'LOW'
+    risk_regions = build_risk_regions(person_detections, pose_detections, motion_score, sharp_detections, detections)
     facial_expression = analyze_facial_expression(image)
     next_action = predict_next_actions(facial_expression, activity, level, len(sharp_detections))
     agent_mesh[2]['payload']['activity'] = activity
@@ -391,9 +558,28 @@ def analyze_frame(payload: CameraFrameRequest):
         'zoneContext': 'restricted perimeter' if level in {'MEDIUM', 'HIGH'} else 'routine patrol',
         'historicalContext': 'repeated suspicious dwell' if level == 'HIGH' else 'normal activity' if level == 'LOW' else 'elevated motion pattern',
     })
+    timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    threat_event = {
+        'userId': user['userId'],
+        'timestamp': timestamp,
+        'riskScore': confidence,
+        'riskThresholdHeatmap': RISK_THRESHOLD_HEATMAP,
+        'riskThresholdEmail': RISK_THRESHOLD_EMAIL,
+        'riskRegions': risk_regions,
+        'threatLevel': level,
+        'reason': 'Possible physical altercation: rapid motion involving multiple people detected.' if interpersonal_aggression else f'{level} risk: {SHARP_MATERIAL_POLICY}' if detected else 'No suspicious object detected in this frame.',
+        'confidence': round(confidence / 100, 2),
+        'source': 'live_camera',
+    }
+    alert = process_threat_event(threat_event, user, ACCOUNT_DB)
     return {
         'ok': True,
         'threatLevel': level,
+        'aggressionDetected': interpersonal_aggression,
+        'riskScore': confidence,
+        'timestamp': timestamp,
+        'threatEvent': threat_event,
+        'alert': alert,
         'detected': detected,
         'detections': all_detections,
         'personDetected': bool(person_detections),
@@ -405,9 +591,11 @@ def analyze_frame(payload: CameraFrameRequest):
         'pose': pose_detections,
         'activity': activity,
         'activityConfidence': activity_confidence,
+        'activitySource': activity_source,
+        'activityQuality': activity_quality,
         'rawActivity': pose_detections[0]['rawActivity'] if pose_detections else 'unknown',
         'activityClasses': ACTIVITY_CLASSES,
-        'message': f'{level} risk: {SHARP_MATERIAL_POLICY}' if detected else 'No suspicious object detected in this frame.',
+        'message': 'Possible physical altercation detected: multiple people showing rapid movement.' if interpersonal_aggression else f'{level} risk: {SHARP_MATERIAL_POLICY}' if detected else 'No suspicious object detected in this frame.',
         'policy': SHARP_MATERIAL_POLICY,
         'agents': agent_mesh,
         'multimodalRisk': multimodal_risk,
@@ -453,74 +641,47 @@ def send_account_email(user_name: str, email: str):
         return False
 
 
-def send_threat_email(emails: list[str], level: str, summary: str, action: str, confidence: float):
-    host = os.getenv('SMTP_HOST')
-    port = int(os.getenv('SMTP_PORT', '587'))
-    sender = os.getenv('SMTP_FROM')
-    username = os.getenv('SMTP_USERNAME')
-    password = os.getenv('SMTP_PASSWORD')
-    if not all((host, sender, username, password)):
-        return False
-
-    message = EmailMessage()
-    message['Subject'] = f'EMERGENCY: Threat Command Center alert - {level.upper()}'
-    message['From'] = sender
-    message['To'] = ', '.join(emails)
-    message.set_content(
-        f'EMERGENCY threat level: {level.upper()}\n\n'
-        f'Confidence: {confidence:.1f}%\n'
-        f'Observation: {summary}\n'
-        f'Recommended action: {action}\n'
-    )
-    try:
-        with smtplib.SMTP(host, port, timeout=15) as smtp:
-            smtp.starttls()
-            smtp.login(username, password)
-            smtp.send_message(message)
-        return True
-    except (OSError, smtplib.SMTPException) as error:
-        logger.error('Threat email delivery failed for %s recipient(s): %s', len(emails), error)
-        return False
-
-
-def registered_alert_recipients() -> list[str]:
-    if not ACCOUNT_DB.exists():
-        return []
-    with sqlite3.connect(ACCOUNT_DB) as connection:
-        rows = connection.execute('SELECT email FROM accounts ORDER BY email').fetchall()
-    return [row[0] for row in rows if row[0]]
-
-
 @app.post('/api/register')
-def register(payload: RegisterRequest, background_tasks: BackgroundTasks):
+def register(payload: RegisterRequest):
     user_name = payload.userName.strip()
     email = payload.email.strip().lower()
     if not user_name or '@' not in email or '.' not in email.rsplit('@', 1)[-1] or len(payload.password) < 4:
         return {'ok': False, 'message': 'Enter a valid name, email address, and password of at least 4 characters.'}
 
+    initialize_account_db()
+    user_id = str(uuid.uuid4())
     with sqlite3.connect(ACCOUNT_DB) as connection:
-        connection.execute('CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, user_name TEXT NOT NULL, password_hash TEXT NOT NULL)')
         existing = connection.execute('SELECT 1 FROM accounts WHERE email = ?', (email,)).fetchone()
         if existing:
             return {'ok': False, 'message': 'An account already exists for this email address.'}
         connection.execute(
-            'INSERT INTO accounts (email, user_name, password_hash) VALUES (?, ?, ?)',
-            (email, user_name, password_digest(payload.password)),
+            'INSERT INTO accounts (user_id, email, user_name, password_hash) VALUES (?, ?, ?, ?)',
+            (user_id, email, user_name, password_digest(payload.password)),
         )
 
     email_configured = all(os.getenv(key) for key in ('SMTP_HOST', 'SMTP_FROM', 'SMTP_USERNAME', 'SMTP_PASSWORD'))
-    if email_configured:
-        background_tasks.add_task(send_account_email, user_name, email)
+    email_sent = send_account_email(user_name, email) if email_configured else False
     return {
         'ok': True,
-        'message': f'Account created for {user_name}. ' + ('A confirmation message is being sent to your email.' if email_configured else 'Email delivery is not configured on this server.'),
-        'emailSent': email_configured,
+        'message': f'Account created for {user_name}. ' + ('A confirmation message was sent to your email.' if email_sent else 'Account email delivery failed. Check the server SMTP configuration.' if email_configured else 'Email delivery is not configured on this server.'),
+        'emailSent': email_sent,
     }
 
 
 @app.get('/api/dataset')
 def dataset():
     return dataset_overview()
+
+
+@app.post('/api/resend-confirmation')
+def resend_confirmation(user: dict = Depends(authenticated_user)):
+    email_configured = all(os.getenv(key) for key in ('SMTP_HOST', 'SMTP_FROM', 'SMTP_USERNAME', 'SMTP_PASSWORD'))
+    email_sent = send_account_email(user['userName'], user['email']) if email_configured else False
+    return {
+        'ok': True,
+        'emailSent': email_sent,
+        'message': 'A confirmation message was sent to your account email.' if email_sent else 'Confirmation email delivery failed. Check the server SMTP configuration.' if email_configured else 'Email delivery is not configured on this server.',
+    }
 
 
 @app.get('/api/agents')
@@ -563,12 +724,12 @@ def login(payload: LoginRequest):
     if not login_id or len(payload.password) < 4:
         return {'ok': False, 'message': 'Enter your account email or operator name and password.'}
 
+    initialize_account_db()
     with sqlite3.connect(ACCOUNT_DB) as connection:
-        connection.execute('CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, user_name TEXT NOT NULL, password_hash TEXT NOT NULL)')
-        account = connection.execute('SELECT email, user_name, password_hash FROM accounts WHERE lower(email) = lower(?) OR lower(user_name) = lower(?)', (login_id, login_id)).fetchone()
+        account = connection.execute('SELECT user_id, email, user_name, password_hash FROM accounts WHERE lower(email) = lower(?) OR lower(user_name) = lower(?)', (login_id, login_id)).fetchone()
     if not account:
         return {'ok': False, 'message': 'No account matches that email or operator name. Create an account first.'}
-    salt, expected_digest = account[2].split('$', 1)
+    salt, expected_digest = account[3].split('$', 1)
     if not secrets.compare_digest(password_digest(payload.password, salt).split('$', 1)[1], expected_digest):
         return {'ok': False, 'message': 'Incorrect account email or password.'}
 
@@ -576,36 +737,25 @@ def login(payload: LoginRequest):
         'label': 'Wall crossing',
         'confidence': 91,
         'objects': ['Person', 'Pen', 'Package', 'Vehicle', 'Weapon'],
-        'summary': f'{account[1]}: MEDIUM threat alert detected. Objects tracked: Person, Pen, Package, Vehicle, Weapon. Training data: Normal Class and Wall crossing frames loaded.',
+        'summary': f'{account[2]}: MEDIUM threat alert detected. Objects tracked: Person, Pen, Package, Vehicle, Weapon. Training data: Normal Class and Wall crossing frames loaded.',
     }
 
-    return {'ok': True, 'userName': account[1], 'email': account[0], 'message': detection['summary']}
+    token = secrets.token_urlsafe(32)
+    with sqlite3.connect(ACCOUNT_DB) as connection:
+        connection.execute('INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)', (token, account[0], datetime.now(timezone.utc).isoformat(timespec='seconds')))
+
+    return {'ok': True, 'userId': account[0], 'userName': account[2], 'email': account[1], 'sessionToken': token, 'message': detection['summary']}
 
 
 @app.post('/api/threat-alert')
-def threat_alert(payload: ThreatAlertRequest, background_tasks: BackgroundTasks):
+def threat_alert(payload: ThreatAlertRequest, user: dict = Depends(authenticated_user)):
     level = payload.level.upper()
     confidence = max(0.0, min(float(payload.confidence), 100.0))
-    if level not in {'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'} or '@' not in payload.email or not 0 <= payload.confidence <= 100:
+    if level not in {'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'} or not 0 <= payload.confidence <= 100:
         return {'ok': False, 'message': 'Invalid threat alert payload.'}
-    if level not in {'HIGH', 'CRITICAL'} or confidence <= HIGH_RISK_EMAIL_CONFIDENCE:
-        return {
-            'ok': True,
-            'emailSent': False,
-            'message': f'Threat recorded; email requires HIGH/CRITICAL risk above {HIGH_RISK_EMAIL_CONFIDENCE:.0f}% confidence.',
-        }
-    recipients = registered_alert_recipients()
-    if not recipients:
-        return {'ok': True, 'emailSent': False, 'recipientCount': 0, 'message': 'Threat recorded; no registered email recipients are available.'}
-    email_configured = all(os.getenv(key) for key in ('SMTP_HOST', 'SMTP_FROM', 'SMTP_USERNAME', 'SMTP_PASSWORD'))
-    if email_configured:
-        background_tasks.add_task(send_threat_email, recipients, level, payload.summary, payload.action, confidence)
-    return {
-        'ok': True,
-        'emailSent': email_configured,
-        'recipientCount': len(recipients),
-        'message': f'Threat alert queued for {len(recipients)} registered account email(s).' if email_configured else 'Threat recorded; email delivery is not configured on this server.',
-    }
+    event = {'userId': user['userId'], 'timestamp': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'riskScore': confidence, 'threatLevel': level, 'reason': payload.summary, 'confidence': round(confidence / 100, 2), 'source': 'manual_alert'}
+    alert = process_threat_event(event, user, ACCOUNT_DB)
+    return {'ok': True, **alert}
 
 
 @app.post('/api/agent-feedback')
