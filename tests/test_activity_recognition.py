@@ -1,5 +1,7 @@
 import unittest
+from pathlib import Path
 
+from backend.activity_recognition import ACTIVITIES, FEATURE_SIZE, TemporalActivityRecognizer, pose_feature_vector
 from backend.server import build_risk_regions, box_iou, classify_risk_band, deduplicate_person_detections
 from backend.server import classify_activity
 
@@ -16,6 +18,30 @@ def pose_points(wrists=((5, 5), (15, 6)), ankles=((45, 48), (55, 48))):
 
 
 class ActivityRecognitionTests(unittest.TestCase):
+    def test_activity_labels_are_central_and_cover_requested_actions(self):
+        self.assertTrue({'STANDING', 'JOGGING', 'CRAWLING', 'KNEELING', 'TURNING', 'STARTING_TO_RUN', 'CLIMBING'} <= set(ACTIVITIES))
+
+    def test_pose_features_are_fixed_size_and_relative_to_person_box(self):
+        features = pose_feature_vector([10, 20, 50, 60], [{'index': 5, 'x': 35, 'y': 50, 'confidence': 90}])
+        self.assertEqual(features.shape, (FEATURE_SIZE,))
+        self.assertAlmostEqual(float(features[5 * 3]), 0.5)
+        self.assertAlmostEqual(float(features[5 * 3 + 1]), 0.5)
+
+    def test_temporal_fallback_smooths_and_posture_agent_resolves_unknown(self):
+        recognizer = TemporalActivityRecognizer(Path('backend/missing-test-model.pth'))
+        box = [20, 10, 30, 70]
+        points = pose_points()
+        predictions = [recognizer.recognize('camera-a', box, points, {'label': 'standing', 'confidence': 90}) for _ in range(5)]
+        self.assertEqual(predictions[-1]['activity'], 'STANDING')
+        self.assertEqual(predictions[-1]['personId'], predictions[0]['personId'])
+        low = recognizer.recognize('camera-b', box, points, {'label': 'crawling', 'confidence': 43})
+        self.assertIn(low['activity'], {'STANDING', 'SITTING'})
+        self.assertEqual(low['model'], 'posture_activity_agent')
+        self.assertEqual(low['status'], 'posture_estimated')
+        movement = recognizer.recognize('camera-c', box, points, {'label': 'running', 'confidence': 90})
+        self.assertIn(movement['activity'], {'STANDING', 'SITTING'})
+
+
     def test_overlapping_person_boxes_are_counted_once(self):
         detections = [
             {'box': [10, 10, 30, 60], 'confidence': 91},

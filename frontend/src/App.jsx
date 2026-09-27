@@ -302,7 +302,7 @@ const analyzeLiveFrame = async (video, sessionToken) => {
       riskScore: payload.riskScore || payload.confidence || 0,
       riskRegions: payload.riskRegions || [],
       riskThresholdHeatmap: payload.riskThresholdHeatmap ?? 60,
-      riskThresholdEmail: payload.riskThresholdEmail ?? 95,
+      riskThresholdEmail: payload.riskThresholdEmail ?? 75,
       timestamp: payload.timestamp,
       alert: payload.alert || null,
       threatEvent: payload.threatEvent || null,
@@ -345,9 +345,12 @@ function App() {
   const [email, setEmail] = useState('')
   const [accountEmail, setAccountEmail] = useState('')
   const [sessionToken, setSessionToken] = useState('')
-  const [authMode, setAuthMode] = useState('login')
+  const [authMode, setAuthMode] = useState(() => new URLSearchParams(window.location.search).has('token') ? 'reset' : 'login')
+  const [resetToken, setResetToken] = useState(() => new URLSearchParams(window.location.search).get('token') || '')
   const [loginError, setLoginError] = useState('')
   const [accountMessage, setAccountMessage] = useState('')
+  const [resetPassword, setResetPassword] = useState('')
+  const [resetPasswordConfirm, setResetPasswordConfirm] = useState('')
   const [scenario, setScenario] = useState('critical')
   const [selectedAgent, setSelectedAgent] = useState(4)
   const [cameraEnabled, setCameraEnabled] = useState(true)
@@ -360,6 +363,7 @@ function App() {
   const [logs, setLogs] = useState(initialLogs)
   const [agentMesh, setAgentMesh] = useState(defaultAgents)
   const [notificationStatus, setNotificationStatus] = useState('')
+  const [emailTestBusy, setEmailTestBusy] = useState(false)
   const [confirmationStatus, setConfirmationStatus] = useState('')
   const [liveThreatState, setLiveThreatState] = useState({
     status: 'Waiting for camera',
@@ -370,7 +374,7 @@ function App() {
     riskScore: 0,
     riskRegions: [],
     riskThresholdHeatmap: 60,
-    riskThresholdEmail: 95,
+    riskThresholdEmail: 75,
     activity: 'unknown',
     activityConfidence: 0,
     multimodalRisk: null,
@@ -384,6 +388,10 @@ function App() {
   const [liveDetections, setLiveDetections] = useState([])
   const [agentMode, setAgentMode] = useState('MEDIUM')
   const [feedbackStatus, setFeedbackStatus] = useState('')
+
+  useEffect(() => {
+    if (resetToken) window.history.replaceState({}, '', window.location.pathname)
+  }, [])
 
   const currentScenario = scenarioConfig[scenario]
   const activeAgent = agentMesh[selectedAgent] || defaultAgents[selectedAgent]
@@ -622,6 +630,76 @@ function App() {
     }
   }
 
+  const handleForgotPassword = async (event) => {
+    event.preventDefault()
+    setLoginError('')
+    setAccountMessage('')
+    try {
+      const response = await fetch('http://localhost:8000/api/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail || 'Unable to process the request. Please try again later.')
+      setAccountMessage(payload.message)
+    } catch (error) {
+      setLoginError(error.message || 'Unable to process the request. Please try again later.')
+    }
+  }
+
+  const handleResetPassword = async (event) => {
+    event.preventDefault()
+    setLoginError('')
+    setAccountMessage('')
+    if (!resetPassword || !resetPasswordConfirm) {
+      setLoginError('Enter and confirm your new password.')
+      return
+    }
+    if (resetPassword !== resetPasswordConfirm) {
+      setLoginError('The passwords do not match.')
+      return
+    }
+    if (resetPassword.length < 4 || resetPassword.length > 256) {
+      setLoginError('Password must be between 4 and 256 characters.')
+      return
+    }
+    try {
+      const response = await fetch('http://localhost:8000/api/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: resetToken, newPassword: resetPassword }),
+      })
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail || 'Password reset failed.')
+      window.history.replaceState({}, '', window.location.pathname)
+      setAuthMode('login')
+      setResetPassword('')
+      setResetPasswordConfirm('')
+      setResetToken('')
+      setAccountMessage('Password changed successfully. You can now log in with your new password.')
+    } catch (error) {
+      setLoginError(error.message || 'Password reset failed.')
+    }
+  }
+
+  const sendTestThreatEmail = async () => {
+    setEmailTestBusy(true)
+    try {
+      const response = await fetch('http://localhost:8000/api/test-threat-email', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${sessionToken}` },
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || result.error || 'Test email failed.')
+      setNotificationStatus(`Test email accepted by the SMTP server for ${result.recipient || 'configured recipient'}.`)
+    } catch (error) {
+      setNotificationStatus(`Test email failed: ${error.message}`)
+    } finally {
+      setEmailTestBusy(false)
+    }
+  }
+
   const handleRegister = async (event) => {
     event.preventDefault()
     setLoginError('')
@@ -723,9 +801,36 @@ function App() {
           </div>
 
           <div className="mb-5 border border-white/15 bg-white/[0.04] p-3 text-sm text-white/65">
-            {authMode === 'login' ? 'Sign in to monitor the defense grid and review active threat messages.' : 'Create an operator account. A security message will be sent to your email when SMTP is configured.'}
+            {authMode === 'login' ? 'Sign in to monitor the defense grid and review active threat messages.' : authMode === 'register' ? 'Create an operator account. A security message will be sent to your email when SMTP is configured.' : authMode === 'forgot' ? 'Enter your registered account email. We will send a reset link if an account exists.' : 'Choose a new password for your ATAS account.'}
           </div>
 
+          {authMode === 'forgot' ? (
+            <form onSubmit={handleForgotPassword} className="space-y-4">
+              <label className="block text-sm text-slate-300">
+                Registered email
+                <div className="mt-2 flex items-center gap-2 border border-white/15 bg-white/[0.04] px-3 py-2">
+                  <Mail className="h-4 w-4 text-white/45" />
+                  <input type="email" required autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} className="w-full bg-transparent text-white outline-none placeholder:text-white/30" placeholder="operator@example.com" />
+                </div>
+              </label>
+              {loginError && <p className="text-sm text-red-300">{loginError}</p>}
+              {accountMessage && <p className="text-sm text-white/70">{accountMessage}</p>}
+              <button type="submit" className="w-full bg-white px-4 py-3 text-sm font-semibold text-black transition hover:bg-white/85">Send Reset Link</button>
+            </form>
+          ) : authMode === 'reset' ? (
+            <form onSubmit={handleResetPassword} className="space-y-4">
+              <label className="block text-sm text-slate-300">
+                New Password
+                <input type="password" required autoComplete="new-password" value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} className="mt-2 w-full border border-white/15 bg-white/[0.04] px-3 py-2 text-white outline-none placeholder:text-white/30" placeholder="At least 4 characters" />
+              </label>
+              <label className="block text-sm text-slate-300">
+                Confirm New Password
+                <input type="password" required autoComplete="new-password" value={resetPasswordConfirm} onChange={(event) => setResetPasswordConfirm(event.target.value)} className="mt-2 w-full border border-white/15 bg-white/[0.04] px-3 py-2 text-white outline-none placeholder:text-white/30" placeholder="Enter the password again" />
+              </label>
+              {loginError && <p className="text-sm text-red-300">{loginError}</p>}
+              <button type="submit" className="w-full bg-white px-4 py-3 text-sm font-semibold text-black transition hover:bg-white/85">Reset Password</button>
+            </form>
+          ) : (
           <form onSubmit={authMode === 'login' ? handleLogin : handleRegister} className="space-y-4">
             <label className="block text-sm text-slate-300">
               {authMode === 'login' ? 'Email or operator name' : 'Operator name'}
@@ -739,6 +844,12 @@ function App() {
                 />
               </div>
             </label>
+
+            {authMode === 'login' && (
+              <div className="text-right">
+                <button type="button" onClick={() => { setAuthMode('forgot'); setLoginError(''); setAccountMessage('') }} className="text-sm text-white/65 underline underline-offset-4 hover:text-white">Forgot Password?</button>
+              </div>
+            )}
 
             {authMode === 'register' && (
               <label className="block text-sm text-white/70">
@@ -789,12 +900,13 @@ function App() {
               {authMode === 'login' ? 'Login to Command Center' : 'Create operator account'}
             </button>
           </form>
+          )}
 
           <div className="mt-5 flex items-center justify-between border-t border-white/15 pt-4 text-sm">
-            <span className="text-white/45">{authMode === 'login' ? 'New operator?' : 'Already registered?'}</span>
+            <span className="text-white/45">{authMode === 'login' ? 'New operator?' : authMode === 'register' ? 'Already registered?' : ''}</span>
             <button
               type="button"
-              onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setLoginError(''); setAccountMessage('') }}
+              onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setLoginError(''); setAccountMessage(''); setResetToken(''); if (new URLSearchParams(window.location.search).has('token')) window.history.replaceState({}, '', window.location.pathname) }}
               className="text-white underline underline-offset-4 hover:text-white/70"
             >
               {authMode === 'login' ? 'Create an account' : 'Back to login'}
@@ -922,7 +1034,7 @@ function App() {
                     }}
                   >
                     <span className="absolute -top-6 left-0 whitespace-nowrap bg-white px-1.5 py-1 text-[10px] font-semibold text-black">
-                      {detection.isPerson ? 'Human' : 'Detected object'} {detection.confidence}%
+                      {detection.isPerson ? 'Human' : detection.isSharp ? `${detection.label}${detection.confirmationFrames ? ` · confirming ${detection.confirmationFrames}/3` : ''}` : detection.label || 'Detected object'} {detection.confidence}%
                     </span>
                   </div>
                 ))}
@@ -949,7 +1061,7 @@ function App() {
           <div className="mt-3 border border-amber-400/25 bg-amber-500/5 px-4 py-3 text-xs text-amber-100">
             {liveThreatState.riskRegions?.length ? liveThreatState.riskRegions.map((region) => (
               <div key={region.personId} className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-200/10 py-1 last:border-0">
-                <span>{region.personId} · {region.label} · {String(region.activity).replaceAll('_', ' ')}</span>
+                <span>{region.personId} · {region.label} · {String(region.activity).replaceAll('_', ' ')}{region.entityType === 'person' ? ` · ${region.activityConfidence ?? 0}% confidence` : ''}</span>
                 <span>{region.riskScore}% · {String(region.riskBand).replaceAll('_', ' ')}</span>
               </div>
             )) : 'No person risk regions detected.'}
@@ -1039,6 +1151,10 @@ function App() {
                 {notificationStatus}
               </p>
             )}
+            <button type="button" disabled={emailTestBusy || !sessionToken} onClick={sendTestThreatEmail}
+              className="mt-3 rounded border border-cyan-400/40 px-3 py-2 text-xs text-cyan-200 disabled:opacity-50">
+              {emailTestBusy ? 'Sending test email…' : 'Send test email'}
+            </button>
             {liveThreatState.alert && (
               <div className="mt-3 grid gap-2 border border-white/15 bg-white/[0.03] p-3 text-xs text-white/70 sm:grid-cols-2">
                 <span>Threat status: {liveThreatState.threatLevel}</span>

@@ -33,6 +33,8 @@ alter table public.threat_alerts add column if not exists message text;
 alter table public.threat_alerts add column if not exists email_recipient text;
 alter table public.threat_alerts add column if not exists email_status text default 'not_required';
 alter table public.threat_alerts add column if not exists sent_at timestamptz;
+alter table public.threat_alerts add column if not exists sent_to text;
+alter table public.threat_alerts add column if not exists provider_email_id text;
 alter table public.threat_alerts add column if not exists created_at timestamptz default timezone('utc', now());
 
 -- Add missing defaults without overwriting existing values.

@@ -1,39 +1,129 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sqlite3
+import urllib.request
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
-
 from backend.email_service import send_threat_notification
 
 
-def process_threat_event(event: dict, user: dict, database_path, email_sender=send_threat_notification) -> dict:
-    """Apply Alert Agent policy to one structured threat event."""
-    threshold = float(os.getenv('RISK_THRESHOLD_EMAIL', os.getenv('RISK_THRESHOLD', '95')))
-    confirmation_frames = max(1, int(os.getenv('CONFIRMATION_FRAMES', '5')))
+logger = logging.getLogger(__name__)
+
+
+def _supabase_request(method: str, path: str, body: dict | None = None, *, prefer: str | None = None):
+    """Make a server-side Supabase REST request without exposing service credentials."""
+    url = os.getenv('SUPABASE_URL', '').rstrip('/')
+    key = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+    if not url or not key:
+        raise RuntimeError('Supabase server credentials are not configured.')
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    request = urllib.request.Request(
+        f'{url}/rest/v1/{path}',
+        data=data,
+        method=method,
+        headers={
+            'apikey': key,
+            'Authorization': f'Bearer {key}',
+            'Content-Type': 'application/json',
+            **({'Prefer': prefer} if prefer else {}),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = response.read()
+        return json.loads(payload) if payload else None
+
+
+def _deliver_queued_alert(alert_id: str, supabase_id: str, confidence: float, threat_level: str,
+                          threat_type: str, location: str | None, message: str, detected_at: str) -> dict:
+    """Claim a Supabase alert, send with server-side SMTP, then record acceptance."""
+    recipient = os.getenv('ALERT_EMAIL', '').strip()
+    if not recipient or '@' not in recipient:
+        logger.error('ALERT_EMAIL is missing or invalid for alert %s.', alert_id)
+        status, error = 'failed', 'ALERT_EMAIL is missing or invalid.'
+    else:
+        claim_path = f'threat_alerts?id=eq.{supabase_id}&email_status=eq.pending&select=id'
+        try:
+            claimed = _supabase_request('PATCH', claim_path, {'email_status': 'processing'}, prefer='return=representation')
+        except Exception as error:
+            logger.exception('Could not claim alert %s for SMTP delivery.', alert_id)
+            return {'ok': False, 'emailStatus': 'PENDING', 'error': f'Could not claim alert ({type(error).__name__}).'}
+        if not claimed:
+            return {'ok': True, 'emailStatus': 'PENDING', 'skipped': True, 'reason': 'duplicate_or_already_processing'}
+
+        accepted = send_threat_notification(
+            recipient, confidence, threat_level, message, detected_at, alert_id,
+            threat_type=threat_type, location=location,
+        )
+        if accepted:
+            status, error = 'sent', None
+            logger.info('SMTP server accepted threat alert %s for %s.', alert_id, recipient)
+        else:
+            status, error = 'failed', 'SMTP server did not accept the threat alert.'
+            logger.error('SMTP delivery failed for threat alert %s.', alert_id)
+
+    update = {
+        'email_status': status,
+        'sent_at': datetime.now(timezone.utc).isoformat() if status == 'sent' else None,
+        'sent_to': recipient if status == 'sent' else None,
+        'email_recipient': recipient if status == 'sent' else None,
+    }
+    try:
+        _supabase_request(
+            'PATCH',
+            f'threat_alerts?id=eq.{supabase_id}&email_status=eq.processing' if recipient else f'threat_alerts?id=eq.{supabase_id}&email_status=eq.pending',
+            update,
+            prefer='return=minimal',
+        )
+    except Exception as update_error:
+        logger.exception('SMTP result could not be recorded for threat alert %s.', alert_id)
+        return {'ok': False, 'emailStatus': 'FAILED' if status != 'sent' else 'PROCESSING',
+                'error': f'Email status update failed ({type(update_error).__name__}).'}
+    return {'ok': status == 'sent', 'emailStatus': status.upper(), 'recipient': recipient if status == 'sent' else None,
+            **({'error': error} if error else {})}
+
+
+def send_test_threat_email() -> dict:
+    """Queue and deliver a clearly labeled test message through the real SMTP path."""
+    alert_id = str(uuid.uuid4())
+    detected_at = datetime.now(timezone.utc).isoformat()
+    _supabase_request('POST', 'threat_alerts', {
+        'id': alert_id,
+        'threat_type': 'Email delivery test',
+        'threat_level': 'HIGH',
+        'confidence': 75,
+        'location': 'Test mode',
+        'detected_at': detected_at,
+        'message': 'This is a test message. No real threat was detected.',
+        'email_status': 'pending',
+    }, prefer='return=minimal')
+    return _deliver_queued_alert(
+        f'ATAS-TEST-{alert_id[:8]}', alert_id, 100, 'HIGH', 'Email delivery test',
+        'Test mode', 'This is a test message. No real threat was detected.', detected_at,
+    )
+
+
+def process_threat_event(event: dict, user: dict, database_path) -> dict:
+    """Queue a qualifying alert in Supabase and send it through configured SMTP."""
     cooldown_minutes = max(0, int(os.getenv('ALERT_COOLDOWN_MINUTES', '5')))
     risk_score = max(0.0, min(float(event.get('riskScore', 0)), 100.0))
+    confidence = risk_score if risk_score <= 1 else risk_score / 100
+    stored_confidence = round(confidence * 100, 2)
     user_id = str(user.get('userId', ''))
     email = str(user.get('email', '')).strip().lower()
-    state = process_threat_event._state.setdefault(user_id, {'high_frames': 0})
-    state['high_frames'] = state['high_frames'] + 1 if risk_score >= threshold else 0
-
     result = {
         'alertId': None,
         'userId': user_id,
-        'riskScore': risk_score,
+        'riskScore': stored_confidence,
         'threatLevel': str(event.get('threatLevel', 'LOW')).upper(),
         'emailSent': False,
         'emailStatus': 'NOT_ELIGIBLE',
-        'confirmationFrames': state['high_frames'],
-        'confirmationRequired': confirmation_frames,
+        'emailThreshold': 0.75,
     }
-    if risk_score < threshold:
-        return result
-    if state['high_frames'] < confirmation_frames:
-        result['emailStatus'] = 'AWAITING_CONFIRMATION'
+    if confidence < 0.75:
         return result
 
     now = datetime.now(timezone.utc)
@@ -47,8 +137,8 @@ def process_threat_event(event: dict, user: dict, database_path, email_sender=se
                 'created_at TEXT NOT NULL)'
             )
             recent = connection.execute(
-                "SELECT 1 FROM alerts WHERE user_id = ? AND email_sent = 1 "
-                "AND created_at >= datetime('now', ?) LIMIT 1",
+                "SELECT 1 FROM alerts WHERE user_id = ? "
+                "AND julianday(created_at) >= julianday('now', ?) LIMIT 1",
                 (user_id, f'-{cooldown_minutes} minutes'),
             ).fetchone()
             alert_id = f"ATAS-{now.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
@@ -56,24 +146,51 @@ def process_threat_event(event: dict, user: dict, database_path, email_sender=se
             if recent:
                 result['emailStatus'] = 'COOLDOWN'
                 return result
-            if not email:
-                result['emailStatus'] = 'NO_AUTHENTICATED_EMAIL'
+            threat_level = result['threatLevel']
+            threat_type = str(event.get('threatType') or event.get('activity') or event.get('source') or 'Threat detected')[:120]
+            location = event.get('location')
+            detected_at = str(event.get('timestamp') or now.isoformat())
+            message = str(event.get('reason') or 'Threat confidence exceeded the configured email threshold.')[:1000]
+            supabase_id = str(uuid.uuid4())
+            try:
+                _supabase_request(
+                    'POST',
+                    'threat_alerts',
+                    {
+                        'id': supabase_id,
+                        'threat_type': threat_type,
+                        'threat_level': threat_level if threat_level in {'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'} else 'HIGH',
+                        'confidence': stored_confidence,
+                        'location': location,
+                        'detected_at': detected_at,
+                        'message': message,
+                        'email_recipient': None,
+                        'email_status': 'pending',
+                    },
+                    prefer='return=minimal',
+                )
+            except Exception as error:
+                result['emailStatus'] = 'FAILED'
+                result['error'] = f'Supabase alert insert failed ({type(error).__name__}).'
+                logger.error('Supabase alert insert failed for alert %s (%s).', alert_id, type(error).__name__)
+                connection.execute(
+                    'INSERT INTO alerts (alert_id, user_id, email, risk_score, threat_level, reason, timestamp, email_sent, email_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
+                    (alert_id, user_id, email, risk_score, threat_level, message[:500], detected_at, result['emailStatus'], now.isoformat()),
+                )
                 return result
 
-            try:
-                sent = bool(email_sender(email, risk_score, result['threatLevel'], event.get('reason', ''), event.get('timestamp', now.isoformat()), alert_id))
-            except Exception:
-                sent = False
-            result['emailSent'] = sent
-            result['emailStatus'] = 'SENT' if sent else 'FAILED'
+            delivery = _deliver_queued_alert(alert_id, supabase_id, stored_confidence, threat_level,
+                                             threat_type, location, message, detected_at)
+            result['emailStatus'] = delivery['emailStatus']
+            result['emailSent'] = delivery['emailStatus'] == 'SENT'
+            if delivery.get('error'):
+                result['error'] = delivery['error']
             connection.execute(
                 'INSERT INTO alerts (alert_id, user_id, email, risk_score, threat_level, reason, timestamp, email_sent, email_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                (alert_id, user_id, email, risk_score, result['threatLevel'], str(event.get('reason', ''))[:500], event.get('timestamp', now.isoformat()), int(sent), result['emailStatus'], now.isoformat()),
+                (alert_id, user_id, email, stored_confidence, result['threatLevel'], str(event.get('reason', ''))[:500], event.get('timestamp', now.isoformat()), int(result['emailSent']), result['emailStatus'], now.isoformat()),
             )
     return result
 
-
-process_threat_event._state = {}
 
 def build_agent_mesh(dataset_info: dict, threat_level: str = 'MEDIUM', action: str = 'perimeter scan'):
     normal_count = next((item['sample_count'] for item in dataset_info.get('classes', []) if item['label'] == 'Normal Class'), 0)

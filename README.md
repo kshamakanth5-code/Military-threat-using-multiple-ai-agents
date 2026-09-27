@@ -45,38 +45,39 @@ The frontend agent definitions are composed in `agents/index.js`. The live camer
 
 ```text
 .
-├── agents/                         JavaScript agent definitions
-│   ├── detectionAgent.js
-│   ├── poseExtractionAgent.js
-│   ├── activityRecognitionAgent.js
-│   ├── intentPredictionAgent.js
-│   ├── threatAnalysisAgent.js
-│   ├── explainabilityAgent.js
-│   ├── alertLearningAgent.js
-│   └── index.js
-├── backend/
-│   ├── server.py                   FastAPI entrypoint and live frame route
-│   ├── agents.py                   Agent mesh and Alert Agent policy
-│   ├── email_service.py            SMTP threat notification service
-│   ├── temporal_context.py         Temporal movement and aggression context
-│   ├── multimodal_risk.py          Sensor and evidence aggregation
-│   ├── anomaly_risk.py             Anomaly risk report
-│   ├── facial_expression.py        Facial-expression and next-action helpers
-│   ├── train_pipeline.py           Normal/wall-crossing image model pipeline
-│   ├── train_activity.py           Activity-training placeholder and data contract
-│   ├── model_meta.json             Threat model metadata
-│   └── accounts.db                 Local account/session/alert database at runtime
-├── frontend/
-│   ├── src/App.jsx                 React dashboard, login, camera, heatmap
-│   ├── src/lib/supabase.js         Optional Supabase client
-│   ├── package.json                Vite frontend dependencies and scripts
-│   └── .env.local                  Local Supabase frontend configuration
-├── dataset_frames/                 Normal and wall-crossing image data
-├── tests/                          Standard-library regression tests
-├── supabase/migrations/            Optional Supabase SQL migration
-├── requirements.txt                Python dependencies
-├── .env.example                    SMTP and risk-policy template
-└── .gitignore                      Local secrets, databases, models, and builds
+â”œâ”€â”€ agents/                         JavaScript agent definitions
+â”‚   â”œâ”€â”€ detectionAgent.js
+â”‚   â”œâ”€â”€ poseExtractionAgent.js
+â”‚   â”œâ”€â”€ activityRecognitionAgent.js
+â”‚   â”œâ”€â”€ intentPredictionAgent.js
+â”‚   â”œâ”€â”€ threatAnalysisAgent.js
+â”‚   â”œâ”€â”€ explainabilityAgent.js
+â”‚   â”œâ”€â”€ alertLearningAgent.js
+â”‚   â””â”€â”€ index.js
+â”œâ”€â”€ backend/
+â”‚   â”œâ”€â”€ server.py                   FastAPI entrypoint and live frame route
+â”‚   â”œâ”€â”€ agents.py                   Agent mesh and Alert Agent policy
+â”‚   â”œâ”€â”€ email_service.py            SMTP threat notification service
+â”‚   â”œâ”€â”€ temporal_context.py         Temporal movement and aggression context
+â”‚   â”œâ”€â”€ multimodal_risk.py          Sensor and evidence aggregation
+â”‚   â”œâ”€â”€ anomaly_risk.py             Anomaly risk report
+â”‚   â”œâ”€â”€ facial_expression.py        Facial-expression and next-action helpers
+â”‚   â”œâ”€â”€ train_pipeline.py           Normal/wall-crossing image model pipeline
+â”‚   â”œâ”€â”€ activity_recognition.py     Activity labels, pose features, GRU and temporal smoother
+â”‚   â”œâ”€â”€ train_activity.py           Subject-separated pose-sequence trainer and evaluator
+â”‚   â”œâ”€â”€ model_meta.json             Threat model metadata
+â”‚   â””â”€â”€ accounts.db                 Local account/session/alert database at runtime
+â”œâ”€â”€ frontend/
+â”‚   â”œâ”€â”€ src/App.jsx                 React dashboard, login, camera, heatmap
+â”‚   â”œâ”€â”€ src/lib/supabase.js         Optional Supabase client
+â”‚   â”œâ”€â”€ package.json                Vite frontend dependencies and scripts
+â”‚   â””â”€â”€ .env.local                  Local Supabase frontend configuration
+â”œâ”€â”€ dataset_frames/                 Normal and wall-crossing image data
+â”œâ”€â”€ tests/                          Standard-library regression tests
+â”œâ”€â”€ supabase/migrations/            Optional Supabase SQL migration
+â”œâ”€â”€ requirements.txt                Python dependencies
+â”œâ”€â”€ .env.example                    SMTP and risk-policy template
+â””â”€â”€ .gitignore                      Local secrets, databases, models, and builds
 ```
 
 ## Technology Stack
@@ -117,7 +118,7 @@ Uses `yolo11n-pose.pt` to extract human keypoints. Keypoints include normalized 
 
 ### 3. Activity Recognition Agent
 
-The current live activity recognizer uses pose geometry, body proportions, motion score, and temporal stabilization. It supports labels including:
+The live recognizer reuses YOLO11's COCO-17 pose keypoints and keeps a short pose history for each tracked person. It applies temporal voting and can load a trained GRU sequence model from `backend/activity_model.pth`. Its extensible labels include:
 
 - standing
 - sitting
@@ -135,8 +136,19 @@ The current live activity recognizer uses pose geometry, body proportions, motio
 - lying
 - crawling
 - sleeping
+- jogging
+- kneeling
+- raising hands
+- turning
+- stopping
+- starting to walk
+- starting to run
+- climbing
+- crouching
 
-The dashboard waits for repeated consistent frames before changing its stable activity label. The repository does not currently contain a trained action-recognition sequence model; therefore these activity labels are pose-geometry heuristics rather than a validated deep action-recognition model.
+Walking, jogging, running, crawling, falling and other movement labels require a trained sequence model; without one they return `UNKNOWN` instead of presenting a single-frame guess as a confident result. Training data layout and limitations are documented in `activity_dataset/README.md`. The current repository has no activity-labeled training sequences, so no trained activity model or activity accuracy metrics are available yet.
+
+The API response contains per-person `activityPrediction` and `activityPredictions` records with activity, normalized confidence, timestamp, pose availability, and a stable per-user person ID. Set `ACTIVITY_DEBUG=true` to include keypoints and the corresponding risk score in the API's `activityDebug` field without changing the UI.
 
 ### 4. Intent Prediction Agent
 
@@ -173,13 +185,10 @@ Implemented in `backend/agents.py` as `process_threat_event`. It:
 
 1. Receives the structured threat event.
 2. Reads the authenticated user ID and email from the server session.
-3. Applies the email risk threshold.
-4. Requires consecutive qualifying frames.
-5. Applies per-user cooldown protection.
-6. Generates an alert ID.
-7. Calls the email notification service.
-8. Persists the alert result in SQLite.
-9. Returns email status to the frontend.
+3. Normalizes confidence to the range 0â€“1 and queues an alert at `0.75` or higher.
+4. Applies the existing per-user cooldown so camera frames from one continuing incident do not create an email every two seconds.
+5. Inserts a `pending` row in Supabase and records the audit result in SQLite.
+6. The trusted FastAPI backend atomically claims the queued row, sends through configured SMTP, and updates the Supabase row only after the SMTP server accepts the message.
 
 ### 8. Learning Agent
 
@@ -261,23 +270,20 @@ Default policy:
 
 ```env
 RISK_THRESHOLD_HEATMAP=60
-RISK_THRESHOLD_EMAIL=95
-CONFIRMATION_FRAMES=5
 ALERT_COOLDOWN_MINUTES=5
 ```
 
 - Risk below 60% does not activate a risk heatmap.
 - Risk from 60% activates the heatmap.
-- Risk from 95% is email-eligible after confirmation.
-- Five consecutive qualifying frames are required by default.
-- A successful alert suppresses repeat emails for five minutes per user.
-- Email failures are recorded and do not crash the pipeline.
+- Email eligibility uses normalized confidence `confidence >= 0.75` (75.0% qualifies).
+- An alert attempt suppresses repeat emails for five minutes per user, including provider failures.
+- Edge Function email failures are recorded as `email_status='failed'` and do not crash camera analysis.
 
 The Alert Agent does not send one email per frame.
 
 ## Email Notifications
 
-Email delivery is implemented in `backend/email_service.py` using SMTP. The sender is configured in the root `.env` file:
+Threat alert and operator confirmation email use server-side SMTP configured in the root `.env`. For Gmail, use a Google App Password rather than the normal account password. The alert recipient is the server-side `ALERT_EMAIL` value:
 
 ```env
 SMTP_HOST=smtp.gmail.com
@@ -285,9 +291,10 @@ SMTP_PORT=587
 SMTP_FROM=sender@example.com
 SMTP_USERNAME=sender@example.com
 SMTP_PASSWORD=google-app-password
+ALERT_EMAIL=operator@example.com
 ```
 
-For Gmail, use a Google App Password rather than the normal account password. The recipient is the authenticated logged-in user's account email.
+The threat email gate is based on normalized confidence: `confidence >= 0.75`. The Supabase column stores the existing percentage scale. A successful SMTP send sets `email_status='sent'`, `sent_to`, and `sent_at`; failures remain failed and leave `sent_to` null. Do not enable the Resend Database Webhook while using SMTP, or both providers may send the same alert. The Edge Function remains available for a future Resend setup with a verified sender domain.
 
 The dashboard also supports a browser notification after a confirmed alert if notification permission is granted. A true background mobile push notification would require a push provider such as Firebase Cloud Messaging and a service worker.
 
@@ -300,6 +307,8 @@ Important backend routes:
 | GET | `/api/health` | Backend/model/email configuration status |
 | POST | `/api/register` | Create a local operator account |
 | POST | `/api/login` | Authenticate and issue a session token |
+| POST | `/api/forgot-password` | Request a reset link (always returns a generic response) |
+| POST | `/api/reset-password` | Validate a one-time token and replace the password |
 | POST | `/api/resend-confirmation` | Resend confirmation through the authenticated account email |
 | POST | `/api/analyze-frame` | Analyze a live camera frame and return agents, risk, regions, and alert state |
 | POST | `/api/threat-alert` | Process an authenticated manual threat event |
@@ -354,7 +363,7 @@ VITE_SUPABASE_ANON_KEY=your-publishable-key
 
 These values belong in `frontend/.env.local`, which is ignored by Git.
 
-The migration at `supabase/migrations/20260924_create_threat_alerts.sql` creates an optional `public.threat_alerts` queue. It includes:
+The existing migration at `supabase/migrations/20260924_create_threat_alerts.sql` describes `public.threat_alerts`, including:
 
 - threat type and level
 - confidence
@@ -366,8 +375,26 @@ The migration at `supabase/migrations/20260924_create_threat_alerts.sql` creates
 - a HIGH/CRITICAL queue trigger
 - Row Level Security
 
-The migration does not send email. A backend worker or Edge Function must process `email_status = 'pending'` using a server-only service-role key. The current local application still persists runtime accounts and alerts in SQLite, so Supabase should be treated as an optional queue until the backend is deliberately migrated.
+The FastAPI backend inserts eligible rows with `email_status='pending'` using server-only `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. It atomically claims each row, sends through Gmail SMTP configured in the root `.env`, and updates the Supabase status only after SMTP accepts the message. Resend Edge Function files remain as a separate option for deployments with a verified sender domain; do not enable their database webhook when SMTP delivery is active.
 
+### Configure Gmail SMTP alerts
+
+Set these server-side values in the root `.env`:
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_FROM=kshamakanth5@gmail.com
+SMTP_USERNAME=kshamakanth5@gmail.com
+SMTP_PASSWORD=your-google-app-password
+ALERT_EMAIL=kshamakanth5@gmail.com
+```
+
+Password reset uses the same SMTP settings. Set `FRONTEND_URL` to the browser-visible app origin so reset links open the right deployment. Optional settings are `PASSWORD_RESET_EXPIRY_MINUTES` (default 15), `PASSWORD_RESET_MAX_REQUESTS` (default 3), and `PASSWORD_RESET_WINDOW_MINUTES` (default 15). Reset tokens are stored as hashes in a dedicated SQLite table; the existing accounts table is unchanged. A successful reset revokes the account's existing login sessions. No separate SQL migration is required; the backend creates the two reset tables when it initializes the existing SQLite database.
+
+Use a Google App Password, not the normal Gmail password. Keep the app password out of Git and browser environment files. Restart the backend after changing `.env`. The dashboard's **Send test email** action exercises the same queue and SMTP delivery path. If a Resend Database Webhook was previously created, disable it to prevent duplicate sends.
+
+Apply `supabase/migrations/20260925_add_email_delivery_metadata.sql` to the existing table if `sent_to` and `provider_email_id` are not already present. Gmail SMTP does not provide a Resend provider email ID, so `provider_email_id` stays null for SMTP sends.
 ## Testing
 
 The repository uses Python's standard-library `unittest` runner:
@@ -376,7 +403,7 @@ The repository uses Python's standard-library `unittest` runner:
 c:/Users/ksham/OneDrive/Desktop/major/.venv-1/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
-The tests cover:
+The Python tests cover:
 
 - activity classification
 - jumping, dancing, and running heuristics
@@ -384,12 +411,14 @@ The tests cover:
 - overlapping-person deduplication
 - heatmap risk bands
 - physical-altercation temporal classification
-- below-threshold alert behavior
-- confirmation frames
-- authenticated recipient routing
+- strict confidence threshold behavior (including exactly 75%)
 - cooldown protection
-- failed email delivery
-- per-user alert isolation
+
+The legacy Resend Edge Function tests cover threshold boundaries and provider failure:
+
+```powershell
+deno test -A supabase/functions/send-threat-alert/index_test.ts
+```
 
 Build the frontend with:
 
@@ -401,29 +430,30 @@ npm --prefix frontend run build
 
 1. Start the backend and frontend.
 2. Register an operator account with a real email address.
-3. Configure valid SMTP credentials in the root `.env`.
+3. Configure Supabase server credentials, Gmail SMTP with a Google App Password, and `ALERT_EMAIL` in the root `.env`. Disable any old Resend Database Webhook.
 4. Log in and allow browser camera permission.
 5. Confirm the backend session token is issued by login.
 6. Open the normal camera view to inspect detections without tint.
 7. Switch to heatmap camera view.
 8. Observe blue/green colors for normal and low-risk activity.
 9. Observe yellow/orange/red/purple heat as risk increases.
-10. Keep a confirmed risk at or above 95% for the configured confirmation frames.
-11. Verify the Alert Agent returns an alert ID and email status.
-12. Verify the authenticated user's email receives the message.
-13. Verify repeated frames remain within cooldown and do not create duplicate emails.
-14. Verify failed SMTP delivery is stored as failed without stopping the camera pipeline.
+10. Generate an event below 75% and verify no email is sent.
+11. Generate an event at or above 75% and verify a pending Supabase row is inserted and claimed.
+12. Verify Gmail SMTP accepts one message, `email_status` becomes `sent`, `sent_to` is populated, and `sent_at` is set.
+13. Replay the same event and verify cooldown/claiming prevents duplicate email.
+14. Simulate an SMTP failure and verify `email_status='failed'` while the camera pipeline continues.
 
 ## Current Limitations and Research Considerations
 
-- The live activity classifier is currently pose-geometry and motion based. It is not a validated deep action-recognition model for every human activity.
-- `train_activity.py` intentionally blocks activity training until labeled activity sequence folders are supplied.
+- No activity-labeled sequence dataset is present, so the activity GRU cannot yet be trained or evaluated.
+- The camera submits an analyzed frame every two seconds (0.5 fps), which is too sparse for reliable gait-cycle distinctions such as walking versus jogging versus running.
+- `train_activity.py` requires genuine action labels and subject-separated clips; it does not treat Normal/Wall crossing or weapon labels as activity ground truth.
 - The existing threat model metadata contains two image classes: `Normal Class` and `Wall crossing`, with 120 recorded training samples in the current metadata.
 - Heatmap risk is a decision-support estimate and should be calibrated against a labeled validation set.
 - Physical-altercation detection is a conservative multi-person rapid-motion heuristic, not proof that a fight occurred.
 - Camera framing, lighting, occlusion, pose confidence, detector confidence, and missing modalities affect output quality.
-- SMTP delivery requires valid provider credentials and may be rejected by providers if app-password or account-security settings are incorrect.
-- The Supabase migration is prepared, but the current backend runtime remains SQLite until a deliberate server-side migration is completed.
+- Threat email requires valid Gmail SMTP credentials, `ALERT_EMAIL`, and Supabase server credentials in the backend environment. SMTP failures are persisted as failed status.
+- The backend still uses SQLite for operator authentication and its local audit log; Supabase stores the email alert queue.
 
 ## Responsible Deployment
 

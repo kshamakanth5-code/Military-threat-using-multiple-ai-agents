@@ -1,0 +1,92 @@
+{
+  "dataset": "activity_dataset/HAR",
+  "datasetNote": "Synthetic stick-figure images; baseline pipeline training only.",
+  "classes": [
+    "crawling",
+    "dancing",
+    "jumping",
+    "running",
+    "walking"
+  ],
+  "splitCounts": {
+    "train": 500,
+    "val": 125,
+    "test": 125
+  },
+  "bestValidationAccuracy": 1.0,
+  "test": {
+    "accuracy": 1.0,
+    "macroF1": 1.0,
+    "perClass": {
+      "crawling": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 25
+      },
+      "dancing": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 25
+      },
+      "jumping": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 25
+      },
+      "running": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 25
+      },
+      "walking": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 25
+      }
+    },
+    "confusionMatrix": [
+      [
+        25,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        25,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        25,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        25,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        25
+      ]
+    ]
+  },
+  "imageSize": 128,
+  "device": "cpu"
+}

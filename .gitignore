@@ -1,6 +1,8 @@
 # Local secrets and environment files
 .env
 *.env.local
+supabase/functions/.env
+supabase/.temp/
 *.db
 
 # Python environments and caches
@@ -19,6 +21,8 @@ build/
 dataset_frames/
 runs/
 *.log
+activity_dataset/
+dataset/
 
 # Large model/checkpoint artifacts
 *.pt

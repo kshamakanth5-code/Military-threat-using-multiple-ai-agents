@@ -1,0 +1,92 @@
+{
+  "dataset": "activity_dataset/ATAS_HUMAN_MOTION_DATASET_FINAL/splits",
+  "datasetNote": "AI-generated 640x640 JPEG motion images; isolated image-classification baseline.",
+  "classes": [
+    "crawling",
+    "dancing",
+    "jumping",
+    "running",
+    "walking"
+  ],
+  "splitCounts": {
+    "train": 265,
+    "val": 55,
+    "test": 60
+  },
+  "bestValidationAccuracy": 1.0,
+  "test": {
+    "accuracy": 1.0,
+    "macroF1": 1.0,
+    "perClass": {
+      "crawling": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 12
+      },
+      "dancing": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 12
+      },
+      "jumping": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 12
+      },
+      "running": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 12
+      },
+      "walking": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 12
+      }
+    },
+    "confusionMatrix": [
+      [
+        12,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        12,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        12,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        12,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        12
+      ]
+    ]
+  },
+  "imageSize": 128,
+  "device": "cpu"
+}
