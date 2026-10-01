@@ -112,6 +112,19 @@ The frontend includes `@supabase/supabase-js` and an optional client in `fronten
 
 Uses the available YOLO models to identify people and detected objects. Person detections include normalized bounding boxes and confidence values. Overlapping person boxes are deduplicated using intersection-over-union logic so one person is not counted twice.
 
+Dangerous-object detections are restricted to knife, gun, launcher, bomb, and other supported weapon labels. Other objects detected by the general COCO model are returned as harmless objects and do not raise the threat score. `backend/train_weapon.py` prepares a filtered knife/gun/launcher dataset; when the Simuletic CCTV dataset is downloaded to `activity_dataset/cctv-weapon-dataset`, it also uses its generic weapon boxes as a separate class and its person-only frames as negative examples. The Simuletic dataset is synthetic and CC BY 4.0; it has no bomb-specific labels, so bomb detection remains open-vocabulary and needs a separately labeled evaluation set.
+
+Download the Simuletic source files while preserving their YOLO annotations, then prepare and train the detector:
+
+```powershell
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Simuletic/cctv-weapon-dataset', repo_type='dataset', local_dir='activity_dataset/cctv-weapon-dataset')"
+python -m backend.train_weapon
+```
+
+The filtered dataset and trained checkpoints are local generated artifacts covered by `.gitignore`. The HF sample has six scene groups; the trainer holds out Scenes 5 and 6 for validation. Its generic weapon boxes are not relabeled as guns or knives. The latest fine-tune scored very poorly on that generic weapon class, so the backend keeps the better validated local detector first and only uses the HF checkpoint as a fallback when the local checkpoint is absent.
+
+For sharp objects, the live path combines `runs/detect/sharp_object_detector/weights/best.pt` with YOLO-World prompts for blades, shiny blades, and sharp metal objects. On the 32-image `dataset_frames/sharp_object_detection/val` split, this ensemble matched 37 of 41 labeled knife/sword boxes at IoU 0.50, with one unmatched detection (90.2% recall, 97.4% precision). That validation set has very few small objects, so it does not establish reliable performance for tiny blades.
+
 ### 2. Pose Extraction Agent
 
 Uses `yolo11n-pose.pt` to extract human keypoints. Keypoints include normalized coordinates and confidence values. Pose boxes support activity classification and dashboard skeleton overlays.
@@ -146,7 +159,7 @@ The live recognizer reuses YOLO11's COCO-17 pose keypoints and keeps a short pos
 - climbing
 - crouching
 
-Walking, jogging, running, crawling, falling and other movement labels require a trained sequence model; without one they return `UNKNOWN` instead of presenting a single-frame guess as a confident result. Training data layout and limitations are documented in `activity_dataset/README.md`. The current repository has no activity-labeled training sequences, so no trained activity model or activity accuracy metrics are available yet.
+When a full activity GRU is not available, the live path reports sustained per-person movement as `MOVING` from the tracked box trajectory and uses pose geometry for coarse postures. Specific gait labels such as walking versus running still need a reliable, real-camera temporal model. Training data layout and limitations are documented in `activity_dataset/README.md`.
 
 The API response contains per-person `activityPrediction` and `activityPredictions` records with activity, normalized confidence, timestamp, pose availability, and a stable per-user person ID. Set `ACTIVITY_DEBUG=true` to include keypoints and the corresponding risk score in the API's `activityDebug` field without changing the UI.
 
@@ -445,7 +458,7 @@ npm --prefix frontend run build
 
 ## Current Limitations and Research Considerations
 
-- No activity-labeled sequence dataset is present, so the activity GRU cannot yet be trained or evaluated.
+- The available activity data is synthetic still imagery plus a small set of broad motion clips; it does not support reliable 28-class activity training. The live fallback reports generic movement and coarse posture.
 - The camera submits an analyzed frame every two seconds (0.5 fps), which is too sparse for reliable gait-cycle distinctions such as walking versus jogging versus running.
 - `train_activity.py` requires genuine action labels and subject-separated clips; it does not treat Normal/Wall crossing or weapon labels as activity ground truth.
 - The existing threat model metadata contains two image classes: `Normal Class` and `Wall crossing`, with 120 recorded training samples in the current metadata.

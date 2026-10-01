@@ -5,7 +5,8 @@ from threading import RLock
 from uuid import uuid4
 
 
-DANGEROUS_OBJECT_CLASSES = frozenset({'scissors', 'knife', 'gun', 'sword'})
+DANGEROUS_OBJECT_CLASSES = frozenset({'scissors', 'knife', 'blade', 'gun', 'sword', 'bomb', 'launcher', 'weapon'})
+SHARP_OBJECT_CLASSES = frozenset({'scissors', 'knife', 'blade', 'sword'})
 
 
 def normalize_dangerous_label(label: object) -> str:
@@ -14,9 +15,30 @@ def normalize_dangerous_label(label: object) -> str:
         'kitchen knife': 'knife',
         'pocket knife': 'knife',
         'dagger': 'knife',
+        'sharp blade': 'blade',
+        'shiny sharp object': 'blade',
+        'shiny blade': 'blade',
+        'metal blade': 'blade',
+        'sharp metal object': 'blade',
+        'metallic blade': 'blade',
+        'sharp object': 'blade',
+        'razor blade': 'blade',
+        'box cutter': 'blade',
+        'utility knife': 'knife',
+        'paring knife': 'knife',
+        'chef knife': 'knife',
         'scissor': 'scissors',
         'firearm': 'gun',
         'handgun': 'gun',
+        'automatic rifle': 'gun',
+        'shotgun': 'gun',
+        'smg': 'gun',
+        'sniper': 'gun',
+        'bazooka': 'launcher',
+        'grenade launcher': 'launcher',
+        'grenade': 'bomb',
+        'explosive': 'bomb',
+        'explosive device': 'bomb',
     }
     return aliases.get(normalized, normalized)
 
@@ -29,6 +51,15 @@ def box_iou(left: list[float], right: list[float]) -> float:
     intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
     union = lw * lh + rw * rh - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def box_overlap_smaller(left: list[float], right: list[float]) -> float:
+    """Return intersection area divided by the smaller box area."""
+    lx, ly, lw, lh = left
+    rx, ry, rw, rh = right
+    intersection = max(0.0, min(lx + lw, rx + rw) - max(lx, rx)) * max(0.0, min(ly + lh, ry + rh) - max(ly, ry))
+    smaller_area = min(lw * lh, rw * rh)
+    return intersection / smaller_area if smaller_area > 0 else 0.0
 
 
 class ObjectTemporalConfirmer:

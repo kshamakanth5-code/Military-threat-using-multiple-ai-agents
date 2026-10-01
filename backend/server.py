@@ -25,12 +25,12 @@ from PIL import Image
 from backend.agents import build_agent_mesh as build_agent_mesh_from_module
 from backend.agents import process_threat_event, send_test_threat_email
 from backend.email_service import send_password_reset_email
-from backend.activity_recognition import ACTIVITIES, TemporalActivityRecognizer
+from backend.activity_recognition import ACTIVITIES, ACTIVITY_REQUIRED_SECONDS, TemporalActivityRecognizer
 from backend.posture_activity_agent import PostureActivityAgent
 from backend.anomaly_risk import build_anomaly_risk_report
 from backend.facial_expression import analyze_facial_expression, predict_next_actions
 from backend.multimodal_risk import build_multimodal_risk_report, build_research_summary
-from backend.object_detection import DANGEROUS_OBJECT_CLASSES, ObjectTemporalConfirmer, associate_person, normalize_dangerous_label
+from backend.object_detection import SHARP_OBJECT_CLASSES, ObjectTemporalConfirmer, associate_person, box_iou, box_overlap_smaller, normalize_dangerous_label
 from backend.temporal_context import build_temporal_context, detect_interpersonal_aggression
 from backend.train_pipeline import dataset_overview, predict_image, train_model
 
@@ -48,18 +48,27 @@ ACCOUNT_DB = Path(__file__).resolve().parent / 'accounts.db'
 MODEL_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(MODEL_ROOT / '.env')
 WEAPON_MODEL_PATHS = [
+    MODEL_ROOT / 'runs' / 'detect' / 'knife_blade_detector' / 'weights' / 'best.pt',
+    MODEL_ROOT / 'runs' / 'detect' / 'guns_knives_coco_detector' / 'weights' / 'best.pt',
+    MODEL_ROOT / 'runs' / 'detect' / 'dangerous_object_detector' / 'weights' / 'best.pt',
+    MODEL_ROOT / 'runs' / 'detect' / 'dangerous_object_detector_hf' / 'weights' / 'best.pt',
     MODEL_ROOT / 'runs' / 'detect' / 'sharp_object_detector' / 'weights' / 'best.pt',
     MODEL_ROOT / 'runs' / 'detect' / 'weapon_detector' / 'weights' / 'best.pt',
     MODEL_ROOT / 'runs' / 'detect' / 'backend' / 'runs' / 'weapon_detector' / 'weights' / 'best.pt',
 ]
 PERSON_MODEL_PATH = MODEL_ROOT / 'yolo11n.pt'
 POSE_MODEL_PATH = MODEL_ROOT / 'yolo11n-pose.pt'
+TRAINED_SHARP_MODEL_PATH = MODEL_ROOT / 'runs' / 'detect' / 'sharp_object_detector' / 'weights' / 'best.pt'
 SHARP_MATERIAL_POLICY = 'Potentially dangerous object detections are reported after temporal confirmation.'
-SHARP_LABELS = DANGEROUS_OBJECT_CLASSES
-OBJECT_DETECTION_CONFIDENCE = max(0.0, min(float(os.getenv('OBJECT_DETECTION_CONFIDENCE', '0.35')), 1.0))
-OBJECT_CONFIRMATION_FRAMES = max(1, int(os.getenv('OBJECT_CONFIRMATION_FRAMES', '3')))
+SHARP_LABELS = SHARP_OBJECT_CLASSES
+# Sharp-object checkpoints can confuse reflective or elongated ordinary objects
+# with blades. Use only concrete object classes and require stronger, persistent
+# detections before reporting one.
+OBJECT_DETECTION_CONFIDENCE = max(0.2, min(float(os.getenv('OBJECT_DETECTION_CONFIDENCE', '0.35')), 1.0))
+OPEN_VOCAB_SHARP_CONFIDENCE = max(0.2, min(float(os.getenv('OPEN_VOCAB_SHARP_CONFIDENCE', '0.35')), 1.0))
+OBJECT_CONFIRMATION_FRAMES = max(2, min(int(os.getenv('OBJECT_CONFIRMATION_FRAMES', '3')), 10))
 OBJECT_CONFIRMER = ObjectTemporalConfirmer(OBJECT_CONFIRMATION_FRAMES)
-ACTIVITY_CLASSES = [label.lower() for label in ACTIVITIES]
+ACTIVITY_CLASSES = [label.lower() for label in ACTIVITIES] + ['moving']
 ACTIVITY_RECOGNIZER = TemporalActivityRecognizer()
 POSTURE_ACTIVITY_AGENT = PostureActivityAgent()
 RISK_THRESHOLD_HEATMAP = float(os.getenv('RISK_THRESHOLD_HEATMAP', '60'))
@@ -70,6 +79,8 @@ person_model = None
 pose_model = None
 sharp_model = None
 sharp_model_attempted = False
+trained_sharp_model = None
+trained_sharp_model_attempted = False
 
 
 class LoginRequest(BaseModel):
@@ -250,7 +261,7 @@ def build_agent_mesh(dataset_info: dict, threat_level: str = 'MEDIUM', action: s
             'name': 'Alert & Learning Agent',
             'status': response_status,
             'color': '#ef4444',
-            'payload': {'model': 'Response policy + feedback loop', 'action': 'alarm_triggered' if is_high else 'notify_operator' if is_medium else 'monitor_only', 'modelUpdate': 'retention_window_2m', 'objectFocus': ['Pen', 'Weapon', 'Vehicle'] if is_high else ['Person', 'Package'], 'learning': 'State outputs are logged for model refinement and continuous retraining.'},
+            'payload': {'model': 'Response policy + feedback loop', 'action': 'alarm_triggered' if is_high else 'notify_operator' if is_medium else 'monitor_only', 'modelUpdate': 'retention_window_2m', 'objectFocus': ['Knife', 'Gun', 'Bomb', 'Launcher', 'Weapon'] if is_high else ['Person', 'Harmless object'], 'learning': 'State outputs are logged for model refinement and continuous retraining.'},
         },
     ]
 
@@ -266,6 +277,8 @@ def health():
         'sharp_detector_available': (MODEL_ROOT / 'yolov8s-worldv2.pt').exists(),
         'sharp_detector_loaded': sharp_model is not None,
         'sharp_detector_attempted': sharp_model_attempted,
+        'trained_sharp_detector_available': TRAINED_SHARP_MODEL_PATH.exists(),
+        'trained_sharp_detector_loaded': trained_sharp_model is not None,
         'object_detection_confidence': OBJECT_DETECTION_CONFIDENCE,
         'object_confirmation_frames': OBJECT_CONFIRMATION_FRAMES,
         'email_configured': email_configured,
@@ -441,7 +454,7 @@ def build_risk_regions(person_detections, pose_detections, motion_score: float, 
             'standing': 8, 'sitting': 5, 'squatting': 12, 'walking': 18,
             'running': 62, 'jumping': 68, 'dancing': 35, 'waving': 22,
             'hands_up': 42, 'clapping': 28, 'kicking': 72, 'bending': 20,
-            'falling': 78, 'lying': 8, 'crawling': 48, 'sleeping': 3,
+            'falling': 78, 'lying': 8, 'crawling': 48, 'sleeping': 3, 'moving': 18,
             'fighting': 96,
         }.get(activity_label, 10)
         risk_score = round(min(100, activity_risk + (motion_score * 30)), 1)
@@ -492,12 +505,30 @@ def load_sharp_model():
         try:
             from ultralytics import YOLO
             candidate = YOLO(str(MODEL_ROOT / 'yolov8s-worldv2.pt'))
-            candidate.set_classes(['scissors', 'knife', 'gun', 'sword'])
+            # Broad appearance prompts (for example "shiny sharp object") often
+            # turn reflections, tools, and other elongated objects into false
+            # knife detections. Restrict open-vocabulary inference to concrete
+            # sharp-object classes; aliases are normalized after prediction.
+            candidate.set_classes(['knife', 'scissors', 'sword', 'blade'])
             sharp_model = candidate
         except Exception:
             logger.exception('Open-vocabulary sharp-object detector failed to load.')
             return None
     return sharp_model
+
+
+def load_trained_sharp_model():
+    global trained_sharp_model, trained_sharp_model_attempted
+    if trained_sharp_model_attempted:
+        return trained_sharp_model
+    trained_sharp_model_attempted = True
+    if TRAINED_SHARP_MODEL_PATH.is_file():
+        try:
+            from ultralytics import YOLO
+            trained_sharp_model = YOLO(str(TRAINED_SHARP_MODEL_PATH))
+        except Exception:
+            logger.exception('Locally trained sharp-object detector failed to load.')
+    return trained_sharp_model
 
 
 @app.post('/api/analyze-frame')
@@ -529,11 +560,32 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
             label = normalize_dangerous_label(label)
             if label not in SHARP_LABELS:
                 continue
-            detections.append({'classId': class_id, 'label': label, 'isPerson': False, 'isSharp': True, 'source': 'weapon_model', 'confidence': round(confidence * 100, 1), 'box': [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]})
+            # This general weapon checkpoint scored poorly on held-out knife and
+            # blade images; the dedicated and open-vocabulary models handle them.
+            if label in {'knife', 'blade', 'scissors'}:
+                continue
+            detections.append({'classId': class_id, 'label': label, 'isPerson': False, 'isObject': True, 'isSharp': True, 'isThreat': True, 'isHarmless': False, 'safetyClassification': 'threat', 'source': 'weapon_model', 'confidence': round(confidence * 100, 1), 'box': [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]})
+
+    trained_detector = load_trained_sharp_model()
+    if trained_detector is not None:
+        trained_result = trained_detector.predict(image, imgsz=640, conf=OBJECT_DETECTION_CONFIDENCE, device='cpu', verbose=False)[0]
+        for box in trained_result.boxes:
+            confidence = float(box.conf.item())
+            class_id = int(box.cls.item())
+            coordinates = box.xyxy[0].tolist()
+            names = trained_detector.names
+            raw_label = names.get(class_id, f'class_{class_id}') if isinstance(names, dict) else names[class_id]
+            label = normalize_dangerous_label(raw_label)
+            if label not in SHARP_LABELS:
+                continue
+            sharp_box = [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]
+            if any(item.get('isSharp') and (box_iou(item['box'], sharp_box) >= 0.3 or box_overlap_smaller(item['box'], sharp_box) >= 0.8) for item in detections):
+                continue
+            detections.append({'classId': class_id, 'label': label, 'isPerson': False, 'isObject': True, 'isSharp': True, 'isThreat': True, 'isHarmless': False, 'safetyClassification': 'threat', 'source': 'trained_sharp_model', 'confidence': round(confidence * 100, 1), 'box': sharp_box})
 
     sharp_detector = load_sharp_model()
     if sharp_detector is not None:
-        sharp_result = sharp_detector.predict(image, imgsz=640, conf=OBJECT_DETECTION_CONFIDENCE, device='cpu', verbose=False)[0]
+        sharp_result = sharp_detector.predict(image, imgsz=640, conf=OPEN_VOCAB_SHARP_CONFIDENCE, device='cpu', verbose=False)[0]
         for box in sharp_result.boxes:
             confidence = float(box.conf.item())
             class_id = int(box.cls.item())
@@ -541,9 +593,17 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
             names = sharp_detector.names
             label = names.get(class_id, f'class_{class_id}') if isinstance(names, dict) else names[class_id] if class_id < len(names) else f'class_{class_id}'
             label = normalize_dangerous_label(label)
-            if label not in SHARP_LABELS or label in recognized_weapon_labels:
+            if label not in SHARP_LABELS:
                 continue
-            detections.append({'classId': class_id, 'label': label, 'isPerson': False, 'isSharp': label.lower() in SHARP_LABELS, 'source': 'sharp_model', 'confidence': round(confidence * 100, 1), 'box': [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]})
+            sharp_box = [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]
+            # Suppress overlapping boxes from the trained and open-vocabulary models.
+            overlap = next((item for item in detections if item.get('isSharp') and (box_iou(item['box'], sharp_box) >= 0.3 or box_overlap_smaller(item['box'], sharp_box) >= 0.8)), None)
+            if overlap is not None:
+                # A concrete open-vocabulary match corroborates the dedicated
+                # model's box, allowing it to pass the stricter standalone floor.
+                overlap['corroborated'] = True
+                continue
+            detections.append({'classId': class_id, 'label': label, 'isPerson': False, 'isObject': True, 'isSharp': True, 'isThreat': True, 'isHarmless': False, 'safetyClassification': 'threat', 'source': 'sharp_model', 'confidence': round(confidence * 100, 1), 'box': sharp_box})
 
     person_detections = []
     if people_model is not None:
@@ -554,15 +614,43 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
             coordinates = box.xyxy[0].tolist()
             box_data = [round(float(coordinates[0]) / image_width * 100, 2), round(float(coordinates[1]) / image_height * 100, 2), round(float(coordinates[2] - coordinates[0]) / image_width * 100, 2), round(float(coordinates[3] - coordinates[1]) / image_height * 100, 2)]
             label = people_model.names.get(class_id, f'class_{class_id}')
-            detection = {'classId': class_id, 'label': label, 'isPerson': class_id == 0, 'isSharp': False, 'source': 'person_model', 'confidence': round(confidence * 100, 1), 'box': box_data}
+            normalized_label = normalize_dangerous_label(label)
+            dangerous = class_id != 0 and normalized_label in SHARP_LABELS
+            if class_id != 0 and not dangerous:
+                continue
+            detection = {'classId': class_id, 'label': normalized_label if dangerous else label, 'isPerson': class_id == 0, 'isObject': dangerous, 'isSharp': dangerous, 'isThreat': dangerous, 'isHarmless': False, 'safetyClassification': 'person' if class_id == 0 else 'threat', 'source': 'person_model', 'confidence': round(confidence * 100, 1), 'box': box_data}
             if class_id == 0:
                 person_detections.append(detection)
-            else:
+            elif dangerous:
                 detections.append(detection)
 
     person_detections = deduplicate_person_detections(person_detections)
 
-    sharp_candidates = [item for item in detections if item.get('isSharp') and item['confidence'] >= OBJECT_DETECTION_CONFIDENCE * 100]
+    confidence_by_source = {
+        'sharp_model': OPEN_VOCAB_SHARP_CONFIDENCE,
+        # Normal footage produced knife guesses up to 0.65 from this checkpoint.
+        # Require a strong standalone score or agreement with the open-vocabulary
+        # detector before accepting a lower-confidence local-model prediction.
+        'trained_sharp_model': 0.70,
+    }
+    source_priority = {'trained_sharp_model': 0, 'sharp_model': 1, 'weapon_model': 2, 'person_model': 3}
+    sharp_candidates = []
+    for item in sorted(
+        (item for item in detections if item.get('isSharp')),
+        key=lambda detection: (source_priority.get(detection.get('source'), 4), -detection['confidence']),
+    ):
+        confidence_floor = confidence_by_source.get(item.get('source'), OBJECT_DETECTION_CONFIDENCE) * 100
+        if item.get('source') == 'trained_sharp_model' and item.get('corroborated'):
+            confidence_floor = OBJECT_DETECTION_CONFIDENCE * 100
+        if item['confidence'] < confidence_floor:
+            continue
+        if any(
+            box_iou(existing['box'], item['box']) >= 0.3
+            or box_overlap_smaller(existing['box'], item['box']) >= 0.8
+            for existing in sharp_candidates
+        ):
+            continue
+        sharp_candidates.append(item)
     object_tracks = OBJECT_CONFIRMER.update(user['userId'], sharp_candidates)
     tracks_by_box = {(track['label'], tuple(track['box'])): track for track in object_tracks}
     detections = [
@@ -573,12 +661,15 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
         } if item.get('isSharp') and (item['label'], tuple(item['box'])) in tracks_by_box else item
         for item in detections
     ]
-    all_detections = person_detections + detections
     for track in object_tracks:
         track['personId'] = associate_person(track, person_detections)
     sharp_detections = [item for item in object_tracks if item['confirmed']]
-    detected = bool(sharp_detections or any(not item.get('isSharp') for item in detections))
-    scoring_detections = person_detections + [item for item in detections if not item.get('isSharp')] + sharp_detections
+    # Candidate boxes are not detections yet. Keep them in objectCandidates
+    # for transparency, but only draw/report sharp objects after confirmation.
+    harmless_detections = []
+    all_detections = person_detections + harmless_detections + sharp_detections
+    detected = bool(sharp_detections)
+    scoring_detections = person_detections + sharp_detections
     motion_score = max(0, min(float(payload.motionScore), 1))
     pose_detections = []
     pose = load_pose_model()
@@ -619,7 +710,7 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
         pose_item['rawActivity'] = raw_activity
         pose_item['confidence'] = round(prediction['confidence'] * 100)
         pose_item['personId'] = prediction['personId']
-        if prediction['model'] == 'posture_activity_agent':
+        if prediction['model'] in {'posture_activity_agent', 'temporal_motion_heuristic'}:
             pose_item['source'] = prediction['model']
         activity_predictions.append(prediction)
         logger.debug('Activity recognition: person=%s activity=%s confidence=%.3f model=%s',
@@ -640,10 +731,9 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
 
     object_confidence = max((item['confidence'] for item in sharp_detections), default=0)
     person_motion = payload.movingPersons > 0
-    object_motion = payload.movingObjects > 0
     interpersonal_aggression = detect_interpersonal_aggression(len(person_detections), motion_score, payload.movingPersons)
     evidence_score = (object_confidence / 100 * 0.45) + (motion_score * 0.4) + (0.15 if person_detections else 0)
-    level = 'HIGH' if interpersonal_aggression or (person_detections and motion_score >= 0.55) else 'MEDIUM' if sharp_detections or detected or person_motion or object_motion else 'LOW'
+    level = 'HIGH' if interpersonal_aggression or (person_detections and motion_score >= 0.55) else 'MEDIUM' if sharp_detections or person_motion else 'LOW'
     confidence = round(min(99, evidence_score * 100)) if (detected or person_detections or person_motion) else 5
     if level == 'HIGH':
         confidence = max(confidence, 75)
@@ -658,6 +748,7 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
             'moving_objects': payload.movingObjects,
             'person_count': len(person_detections),
             'sharp_object_count': len(sharp_detections),
+            'harmless_object_count': len(harmless_detections),
             'interpersonal_aggression': interpersonal_aggression,
         }
     agent_mesh[0]['payload']['detections'] = all_detections
@@ -693,6 +784,7 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
     multimodal_risk = build_multimodal_risk_report({
         'detections': scoring_detections,
         'sharpObjects': sharp_detections,
+        'harmlessObjects': harmless_detections,
         'motion': {'score': round(motion_score, 2), 'movingPersons': payload.movingPersons, 'movingObjects': payload.movingObjects},
         'pose': pose_detections,
         'confidence': confidence,
@@ -766,6 +858,10 @@ def analyze_frame(payload: CameraFrameRequest, user: dict = Depends(authenticate
         'pose': pose_detections,
         'activity': activity,
         'activityConfidence': activity_confidence,
+        'activityAnalysisStatus': activity_predictions[0]['status'] if activity_predictions else 'no_person_detected',
+        'activityObservations': activity_predictions[0].get('observationCount', 0) if activity_predictions else 0,
+        'activityElapsedSeconds': activity_predictions[0].get('observationElapsedSeconds', 0) if activity_predictions else 0,
+        'activityRequiredSeconds': activity_predictions[0].get('requiredSeconds', ACTIVITY_REQUIRED_SECONDS) if activity_predictions else ACTIVITY_REQUIRED_SECONDS,
         'activityPrediction': activity_predictions[0] if activity_predictions else {
             'personId': None,
             'activity': 'LOW_CONFIDENCE' if person_detections else 'UNKNOWN',
@@ -921,8 +1017,8 @@ def login(payload: LoginRequest):
     detection = {
         'label': 'Wall crossing',
         'confidence': 91,
-        'objects': ['Person', 'Pen', 'Package', 'Vehicle', 'Weapon'],
-        'summary': f'{account[2]}: MEDIUM threat alert detected. Objects tracked: Person, Pen, Package, Vehicle, Weapon. Training data: Normal Class and Wall crossing frames loaded.',
+        'objects': ['Person', 'Knife', 'Gun', 'Bomb', 'Launcher', 'Weapon', 'Harmless object'],
+        'summary': f'{account[2]}: dangerous objects are tracked separately from harmless objects. Training data: Normal Class and Wall crossing frames loaded.',
     }
 
     token = secrets.token_urlsafe(32)

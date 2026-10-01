@@ -258,17 +258,8 @@ const analyzeLiveFrame = async (video, sessionToken) => {
     }
     const motion = getMotionMetrics(payload.detections || [])
     video._motionMetrics = motion
-    const activityHistory = [...(video._activityHistory || []), payload.activity || 'unknown'].slice(-5)
-    video._activityHistory = activityHistory
-    const activityCounts = activityHistory.reduce((counts, label) => ({ ...counts, [label]: (counts[label] || 0) + 1 }), {})
-    const candidateActivity = Object.entries(activityCounts).sort((first, second) => second[1] - first[1])[0]?.[0] || 'unknown'
-    const previousActivity = video._stableActivity || 'unknown'
-    const candidateFrames = activityHistory.filter((label) => label === candidateActivity).length
-    const stableActivity = previousActivity === 'unknown'
-      ? candidateFrames >= 3 ? candidateActivity : 'unknown'
-      : candidateActivity === previousActivity || candidateFrames >= 3
-        ? candidateActivity
-        : previousActivity
+    const activityObserving = payload.activityAnalysisStatus === 'observing'
+    const stableActivity = activityObserving ? 'unknown' : payload.activity || 'unknown'
     video._stableActivity = stableActivity
     const threatHistory = [...(video._threatHistory || []), payload.threatLevel || 'LOW'].slice(-5)
     video._threatHistory = threatHistory
@@ -276,6 +267,10 @@ const analyzeLiveFrame = async (video, sessionToken) => {
     const highFrames = threatHistory.filter((level) => level === 'HIGH' || level === 'CRITICAL').length
     const mediumFrames = threatHistory.filter((level) => level === 'MEDIUM').length
     const personPresent = Boolean(payload.personDetected)
+    const activityAnalyzing = personPresent && (activityObserving || stableActivity === 'unknown')
+    const activityProgress = activityObserving
+      ? `Analyzing movement (${Math.min(payload.activityElapsedSeconds || 0, 3).toFixed(1)}/3.0 seconds)`
+      : `Human activity: ${stableActivity.replaceAll('_', ' ')}`
     const threatConfirmed = threatHistory.length >= 3
     const stableThreatLevel = highFrames >= 3
       ? 'HIGH'
@@ -296,7 +291,7 @@ const analyzeLiveFrame = async (video, sessionToken) => {
     const strongest = payload.confidence || payload.detections?.reduce((best, detection) => Math.max(best, detection.confidence), 0) || 0
     return {
       status,
-      action: payload.detected || payload.aggressionDetected ? payload.message : stableActivity !== 'unknown' ? `Human activity: ${stableActivity}` : motion.movingPersons ? 'Person movement tracked' : motion.movingObjects ? 'Object movement tracked' : personPresent ? 'Monitoring person movement' : 'No person detected in current frame',
+      action: payload.detected || payload.aggressionDetected ? payload.message : activityAnalyzing ? activityProgress : stableActivity !== 'unknown' ? `Human activity: ${stableActivity}` : motion.movingPersons ? 'Person movement tracked' : motion.movingObjects ? 'Object movement tracked' : personPresent ? 'Monitoring person movement' : 'No person detected in current frame',
       confidence: payload.detected ? strongest : activity.confidence,
       threatLevel: isAssessing ? 'LOW' : stableThreatLevel,
       riskScore: payload.riskScore || payload.confidence || 0,
@@ -310,11 +305,16 @@ const analyzeLiveFrame = async (video, sessionToken) => {
       riskConfirmed: !isAssessing,
       assessmentFrames: threatHistory.length,
       motion,
-      activity: stableActivity,
-      rawActivity: payload.rawActivity || stableActivity,
+      activity: stableActivity !== 'unknown' ? stableActivity : activityAnalyzing ? 'analyzing' : stableActivity,
+      rawActivity: payload.rawActivity || payload.activity || stableActivity,
+      activityAnalysisStatus: payload.activityAnalysisStatus || 'unknown',
+      activityObservations: payload.activityObservations || 0,
+      activityElapsedSeconds: payload.activityElapsedSeconds || 0,
+      activityRequiredSeconds: payload.activityRequiredSeconds || 3,
+      activityConfidence: payload.activityConfidence || 0,
       activitySource: payload.activitySource || 'unknown',
       activityQuality: payload.activityQuality || 'LOW',
-      activityClasses: payload.activityClasses || ['standing', 'sitting', 'squatting', 'walking', 'running', 'jumping', 'dancing', 'waving', 'hands_up', 'clapping', 'kicking', 'bending', 'falling', 'lying', 'crawling', 'sleeping', 'fighting'],
+      activityClasses: payload.activityClasses || ['standing', 'sitting', 'squatting', 'walking', 'running', 'jumping', 'dancing', 'waving', 'hands_up', 'clapping', 'kicking', 'bending', 'falling', 'lying', 'crawling', 'sleeping', 'fighting', 'moving'],
       pose: payload.pose || [],
       detections: payload.detections || [],
       personCount: payload.personCount || 0,
@@ -403,9 +403,9 @@ function App() {
   const heatmapScreenColor = riskHeatColor(maximumRisk, maximumRisk >= 95 ? 0.42 : maximumRisk >= 60 ? 0.24 : 0.12)
 
   const detectedObjects = useMemo(() => {
-    const objects = ['Person', 'Pen', 'Package', 'Vehicle']
+    const objects = ['Person', 'Harmless objects']
     if (currentScenario.threatLevel !== 'LOW') {
-      objects.push('Weapon')
+      objects.push('Dangerous object')
     }
     return objects
   }, [currentScenario.threatLevel])
@@ -460,7 +460,9 @@ function App() {
         let stream
         try {
           stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+            // Prefer the built-in/front-facing webcam (the natural default on laptops).
+            // `environment` can select a phone's rear camera when the dashboard is opened on mobile.
+            video: { facingMode: { ideal: 'user' }, width: { ideal: 1280 }, height: { ideal: 720 } },
             audio: false,
           })
         } catch {
@@ -505,18 +507,22 @@ function App() {
     if (!isLoggedIn || !cameraEnabled || uploadedFile || !videoRef.current) return
 
     let active = true
+    let timer = null
     const analyze = async () => {
-      const result = await analyzeLiveFrame(videoRef.current, sessionToken)
-      if (!active) return
-      setLiveThreatState(result)
-      setLiveDetections(result.detections || [])
-      if (result.agents?.length) setAgentMesh(result.agents)
-      setAgentMode(result.threatLevel === 'HIGH' ? 'HIGH' : result.threatLevel === 'MEDIUM' ? 'SUSPICIOUS' : 'LOW')
+      try {
+        const result = await analyzeLiveFrame(videoRef.current, sessionToken)
+        if (!active) return
+        setLiveThreatState(result)
+        setLiveDetections(result.detections || [])
+        if (result.agents?.length) setAgentMesh(result.agents)
+        setAgentMode(result.threatLevel === 'HIGH' ? 'HIGH' : result.threatLevel === 'MEDIUM' ? 'SUSPICIOUS' : 'LOW')
+      } finally {
+        if (active) timer = setTimeout(analyze, 1200)
+      }
     }
     analyze()
-    const interval = setInterval(analyze, 2000)
 
-    return () => { active = false; clearInterval(interval) }
+    return () => { active = false; clearTimeout(timer) }
   }, [cameraEnabled, isLoggedIn, uploadedFile, sessionToken])
 
   useEffect(() => {
@@ -1034,7 +1040,7 @@ function App() {
                     }}
                   >
                     <span className="absolute -top-6 left-0 whitespace-nowrap bg-white px-1.5 py-1 text-[10px] font-semibold text-black">
-                      {detection.isPerson ? 'Human' : detection.isSharp ? `${detection.label}${detection.confirmationFrames ? ` · confirming ${detection.confirmationFrames}/3` : ''}` : detection.label || 'Detected object'} {detection.confidence}%
+                      {detection.isPerson ? 'Human' : (detection.isThreat || detection.isSharp) ? `Threat: ${detection.label}${detection.confirmationFrames ? ` · confirmed` : ''}` : `Object: ${detection.label || 'object'}`} {detection.confidence}%
                     </span>
                   </div>
                 ))}
@@ -1049,7 +1055,7 @@ function App() {
               <p className="mt-1 text-xs text-white/45">{liveThreatState.action}</p>
                  <p className="mt-1 text-xs uppercase tracking-[0.16em] text-cyan-300">Activity: {liveThreatState.activity || 'unknown'}</p>
                  <p className="mt-1 text-xs uppercase tracking-[0.16em] text-white/55">
-                   Humans: {liveThreatState.personCount || liveThreatState.pose?.length || 0} · Sharp objects: {liveThreatState.sharpObjectCount || 0}
+                   Humans: {liveThreatState.personCount || liveThreatState.pose?.length || 0} · Threat objects: {liveThreatState.sharpObjectCount || 0} · Other objects: {liveThreatState.harmlessObjects?.length || 0}
                  </p>
                 <p className="mt-1 text-[10px] text-white/40">Raw model inference: {liveThreatState.rawActivity || 'unknown'}</p>
                 <p className="mt-1 text-[10px] text-amber-200/75">

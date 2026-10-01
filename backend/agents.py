@@ -299,7 +299,7 @@ def build_agent_mesh(dataset_info: dict, threat_level: str = 'MEDIUM', action: s
                 'model': 'Response policy + feedback loop',
                 'action': 'alarm_triggered' if is_high else 'notify_operator' if is_medium else 'monitor_only',
                 'modelUpdate': 'retention_window_2m',
-                'objectFocus': ['Pen', 'Weapon', 'Vehicle'] if is_high else ['Person', 'Package'],
+                'objectFocus': ['Knife', 'Gun', 'Bomb', 'Launcher', 'Weapon'] if is_high else ['Person', 'Harmless object'],
                 'learning': 'State outputs are logged for model refinement and continuous retraining.',
             },
         },

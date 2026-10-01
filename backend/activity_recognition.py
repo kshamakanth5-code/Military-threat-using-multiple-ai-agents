@@ -6,6 +6,7 @@ from functools import wraps
 import os
 from pathlib import Path
 from threading import RLock
+import time
 
 import numpy as np
 import torch
@@ -26,6 +27,7 @@ POSE_KEYPOINTS = 17
 FEATURE_SIZE = POSE_KEYPOINTS * 3 + 4
 SEQUENCE_LENGTH = 24
 PREDICTION_WINDOW = 5
+ACTIVITY_REQUIRED_SECONDS = 3.0
 MIN_ACTIVITY_CONFIDENCE = max(0.0, min(float(os.getenv('ACTIVITY_MIN_CONFIDENCE', '0.50')), 1.0))
 TEMPORAL_ONLY_ACTIVITIES = {
     'WALKING', 'RUNNING', 'JOGGING', 'CRAWLING', 'FALLING', 'JUMPING',
@@ -115,7 +117,9 @@ class TemporalActivityRecognizer:
             if previous['age'] > 8:
                 continue
             distance = ((center_x - previous['x']) ** 2 + (center_y - previous['y']) ** 2) ** 0.5
-            gate = max(12.0, (float(box[2]) + float(box[3])) * 0.4)
+            # Camera frames arrive every two seconds, so a moving person can
+            # shift farther than a tight frame-to-frame IoU tracker allows.
+            gate = min(45.0, max(15.0, float(box[3]) * 2.2))
             if distance <= gate and distance < best_distance:
                 best_id, best_distance = track_id, distance
         if best_id is None:
@@ -128,6 +132,9 @@ class TemporalActivityRecognizer:
             'currentActivity': 'LOW_CONFIDENCE',
             'centerTrajectory': deque(maxlen=12),
             'movementHistory': deque(maxlen=12),
+            'observationTrajectory': deque(maxlen=8),
+            'observationCount': 0,
+            'observationStartedAt': None,
         })
         previous_center = (state.get('x', center_x), state.get('y', center_y))
         state['lastDisplacement'] = float(np.hypot(center_x - previous_center[0], center_y - previous_center[1]))
@@ -150,11 +157,64 @@ class TemporalActivityRecognizer:
         index = int(torch.argmax(probabilities).item())
         return ACTIVITIES[index], float(probabilities[index].item())
 
+    @staticmethod
+    def _trajectory_motion(state: dict) -> tuple[str, float, float] | None:
+        """Estimate sustained person movement from the tracked center over time.
+
+        Speed is normalized by the person's visible height so the thresholds do
+        not depend directly on camera resolution or distance from the camera.
+        Require a sustained, mostly consistent trajectory to avoid labeling box
+        jitter as movement.
+        """
+        observations = list(state.get('observationTrajectory', ()))
+        if len(observations) < 3:
+            return None
+        observations = observations[-6:]
+        elapsed = observations[-1][0] - observations[0][0]
+        if elapsed < ACTIVITY_REQUIRED_SECONDS:
+            return None
+        height = sum(item[3] for item in observations) / len(observations)
+        if height < 1:
+            return None
+        path_length = sum(
+            float(np.hypot(current[1] - previous[1], current[2] - previous[2]))
+            for previous, current in zip(observations, observations[1:])
+        )
+        net_displacement = float(np.hypot(
+            observations[-1][1] - observations[0][1],
+            observations[-1][2] - observations[0][2],
+        ))
+        speed = net_displacement / height / elapsed
+        straightness = net_displacement / max(path_length, 1e-6)
+        if straightness < 0.55 or net_displacement / height < 0.45:
+            return None
+        if speed >= 0.2:
+            return 'MOVING', min(0.82, 0.55 + speed * 0.3), speed
+        return None
+
     @_serialized
     def recognize(self, scope: str, person_box: list[float], keypoints: list[dict], fallback: dict, timestamp: str | None = None) -> dict:
         person_id = self._track_id(scope, person_box)
         key = (scope, person_id)
         state = self._tracks[scope][person_id]
+        observed_at = time.monotonic()
+        trajectory = state['observationTrajectory']
+        if trajectory and observed_at - trajectory[-1][0] > 4.0:
+            trajectory.clear()
+            state['observationCount'] = 0
+            state['observationStartedAt'] = None
+            self._predictions[key].clear()
+        if state.get('observationStartedAt') is None:
+            state['observationStartedAt'] = observed_at
+        center_x = float(person_box[0]) + float(person_box[2]) / 2
+        center_y = float(person_box[1]) + float(person_box[3]) / 2
+        trajectory.append((
+            observed_at,
+            center_x,
+            center_y,
+            max(float(person_box[3]), 1.0),
+        ))
+        state['observationCount'] += 1
         orientation = self._body_orientation(keypoints)
         self._features[key].append(pose_feature_vector(person_box, keypoints))
         prediction = self._model_prediction(key)
@@ -185,6 +245,12 @@ class TemporalActivityRecognizer:
             )
             selected = posture['activity']
             selected_confidence = posture['confidence']
+        trajectory_motion = self._trajectory_motion(state) if prediction is None else None
+        if trajectory_motion is not None:
+            selected, selected_confidence, movement_speed = trajectory_motion
+            posture_fallback = False
+        else:
+            movement_speed = 0.0
         activity_label = selected
         stamp = timestamp or datetime.now(timezone.utc).isoformat(timespec='milliseconds')
         previous = state.get('currentActivity', activity_label)
@@ -199,6 +265,8 @@ class TemporalActivityRecognizer:
             'motionScore': round(float(fallback.get('motionScore', 0.0) or 0.0), 3),
             'activity': activity_label,
         })
+        elapsed_seconds = max(0.0, observed_at - state['observationStartedAt'])
+        activity_ready = elapsed_seconds >= ACTIVITY_REQUIRED_SECONDS
         result = {
             'personId': person_id,
             'activity': activity_label,
@@ -206,13 +274,17 @@ class TemporalActivityRecognizer:
             'confidence': round(selected_confidence, 3),
             'timestamp': stamp,
             'poseAvailable': bool(keypoints),
-            'status': 'posture_estimated' if posture_fallback else 'classified',
+            'status': 'classified' if activity_ready else 'observing',
+            'observationCount': state['observationCount'],
+            'observationElapsedSeconds': round(elapsed_seconds, 2),
+            'requiredSeconds': ACTIVITY_REQUIRED_SECONDS,
             'poseLandmarks': list(keypoints),
             'movementHistory': list(state['movementHistory']),
             'bodyOrientation': orientation,
             'centerTrajectory': list(state['centerTrajectory']),
-            'model': 'posture_activity_agent' if posture_fallback else 'temporal_gru' if self.model is not None and len(self._features[key]) >= 8 else 'temporal_pose_fallback',
+            'model': 'temporal_motion_heuristic' if trajectory_motion is not None else 'posture_activity_agent' if posture_fallback else 'temporal_gru' if self.model is not None and len(self._features[key]) >= 8 else 'temporal_pose_fallback',
             'activityAgent': self.posture_agent.name if posture_fallback else None,
+            'movementSpeedBodyLengthsPerSecond': round(movement_speed, 3),
         }
         return result
 

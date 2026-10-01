@@ -9,4 +9,5 @@ ultralytics
 openai-clip
 opencv-python>=4.8,<5
 transformers>=4.45,<6
+huggingface_hub
 setuptools<81

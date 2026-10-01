@@ -153,7 +153,7 @@ def dataset_overview():
     return {
         'dataset_root': str(DATASET_DIR),
         'classes': overview,
-        'special_objects': ['Person', 'Pen', 'Package', 'Vehicle', 'Weapon'],
+        'special_objects': ['Person', 'Knife', 'Gun', 'Bomb', 'Launcher', 'Weapon', 'Harmless object'],
         'activity_classes': ACTIVITY_CLASSES,
         'activity_training_available': False,
         'training_note': 'Threat model uses all available Normal Class and Wall crossing frames. Activity labels require labeled video sequences.',
